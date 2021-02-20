@@ -4,7 +4,7 @@ from curses import wrapper
 from curses.textpad import Textbox, rectangle
 
 cur_pos = 2
-wsize = 10
+wsize = 15
 hsize = 2
 titles = []
 curtab = -1
@@ -39,9 +39,7 @@ def print_tab(stdscr, name, active):
     lrx = cur_pos + wsize
     rectangle(stdscr, uly, ulx, lry, lrx)
 
-    stdscr.addstr(uly+1, cur_pos + 1, f"{name}", curses.color_pair(active)) # {uly} {ulx} {lry} {lrx}")
-
-    # box = Textbox(win)
+    stdscr.addstr(uly+1, cur_pos + 1, f"{name}", curses.color_pair(active))
 
     cur_pos += wsize + 1
 
@@ -61,16 +59,18 @@ def move_right():
 
 
 def edit_title(stdscr):
-    # stdscr.addstr(0, 0, "New Title: (hit Ctrl-G to send)")
-
+    # Enable cursor
     curses.curs_set(1)
+
+    # Add a window on top of the current title
     editwin = curses.newwin(1,wsize - 1, 1, curtab*(wsize+1) + 1)
 
     stdscr.refresh()
-
-
     box = Textbox(editwin)
+    # Edit it up to wsize -1
     box.edit()
+
+    # Disable cursor again
     curses.curs_set(0)
 
     # Get resulting contents
