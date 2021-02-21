@@ -96,8 +96,10 @@ def print_tab(stdscr, tab, active):
 
     title = tab.name
     stdscr.addstr(uly+1, cur_pos + 1, f"{title}", curses.color_pair(active))
-
     cur_pos += wsize + 1
+
+    if pristine.paused:
+        stdscr.addstr(uly+1, curses.COLS - 10, f"PAUSED", curses.color_pair(2))
 
 
 def move_left():
@@ -150,8 +152,29 @@ def print_text_box(scroll):
     win.scrollok(True)
 
     for line in pristine.main:
-        if (curtab < 0) or (titles[curtab].grep in line):
+        if curtab < 0:
+            # Dump the whole text
             win.addstr(line)
+
+        word = titles[curtab].grep
+
+        if not word:
+            win.addstr(line)
+            continue
+
+        if word in line:
+            win.addstr(line)
+            continue
+            # parts = line.split(word)
+            # for p in parts:
+                # debug()
+                # if p == '':
+                #     win.attron(curses.A_BOLD)
+                #     win.addstr(word)
+                #     win.addstr('X')
+                #     win.attron(curses.A_NORMAL)
+                # else:
+                #     win.addstr(p)
 
 
     win.refresh()
@@ -260,7 +283,7 @@ def ingest_from_stdin():
     global quitting
     global EOF
 
-    while True:
+    while not quitting :
         line = sys.stdin.readline()
 
         if not line:
@@ -284,14 +307,15 @@ def ingest_from_stdin():
 
 
 if __name__ == "__main__":
-
     curses.initscr()
 
     curses.cbreak()
     curses.noecho()
     curses.curs_set(0)
     curses.start_color()
-    curses.init_pair(1, curses.COLOR_RED, curses.COLOR_WHITE)
+    curses.init_pair(1, curses.COLOR_BLUE, curses.COLOR_WHITE)
+    curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+
 
     x = threading.Thread(target=ingest_from_file)
     # x = threading.Thread(target=ingest_from_stdin)
@@ -299,7 +323,7 @@ if __name__ == "__main__":
 
     try:
         wrapper(main)
-    except Exception:
+    except KeyboardInterrupt:
         # Let the other thread exist also
         quitting = True
 
