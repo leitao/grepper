@@ -198,6 +198,7 @@ def draw_screen(stdscr, scroll):
 def main(stdscr):
     global quitting
     stdscr.keypad(True)
+    # Block TIMEOUT ms (100 ms)
     stdscr.timeout(TIMEOUT)
 
     key = ''
@@ -208,7 +209,7 @@ def main(stdscr):
     scroll = 0
     while key != ord('q'):
         draw_screen(stdscr, scroll)
-        # Block TIMEOUT ms (100 ms)
+
         key = stdscr.getch()
 
         if key == ord('a'):
