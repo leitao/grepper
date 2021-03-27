@@ -6,6 +6,17 @@ from curses.textpad import Textbox, rectangle
 import time
 import sys
 import pathlib
+import json
+from json import JSONEncoder
+import re
+
+# Color names
+COLOR_INSENSITIVE_NOT_SELECTED = 1
+COLOR_INSENSITIVE_SELECTED = 2
+COLOR_SENSITIVE_SELECTED = 3
+COLOR_SENSITIVE_NOT_SELECTED = 4
+COLOR_STOPPED = 5
+COLOR_WORD_FOUND = 6
 
 cur_pos = 2
 wsize = 15
@@ -62,28 +73,20 @@ class Buffer:
         self.consumable = False
         return self.main_buffer
 
+
+class TabEncoder(JSONEncoder):
+    def default(self, o):
+        return o.__dict__
+
 # Ingestion Buffer
 pristine = Buffer()
 
 
 class Tab:
-    name = ""
-    buffer = []
-    grep = ""
-    case_sensitive = True
-    i = 0
-
     def __init__(self, title):
         self.name = title
-
-    # def ingest_into_tab(self, string: str):
-    #     if not self.grep:
-    #         self.buffer.append(f" {self.name}: {self.i}: " + string)
-    #     elif self.grep in string:
-    #         self.buffer.append(string)
-    #     self.i += 1
-
-
+        self.grep = ""
+        self.case_sensitive = True
 
 def delete_tab():
     global curtab
@@ -104,7 +107,7 @@ def add_new_tab():
 
     redraw = True
     curtab += 1
-    titles.append(Tab(f"Panel {curtab}"))
+    titles.append(Tab(f"Unfiltered"))
 
 
 def print_all_tabs(stdscr):
@@ -127,7 +130,6 @@ def print_tab(stdscr, tab, active):
     rectangle(stdscr, uly, ulx, lry, lrx)
 
 
-    title = tab.name
     if (tab.case_sensitive and active):
         color = curses.color_pair(COLOR_SENSITIVE_SELECTED)
     elif (tab.case_sensitive and not active):
@@ -139,10 +141,12 @@ def print_tab(stdscr, tab, active):
     else:
         raise Exception("no color selected")
 
-    # if tab.case_sensitive:
-    # else:
-    #     color = curses.color_pair(case_insensitive)
-    stdscr.addstr(uly+1, cur_pos + 1, f"{title}", color)
+    if not tab.case_sensitive:
+        title = tab.name.lower()
+    else:
+        title = tab.name
+
+    stdscr.addstr(uly+1, cur_pos + 1, f"{title} ", color)
     cur_pos += wsize + 1
 
     if pristine.paused:
@@ -174,27 +178,8 @@ def move_right():
         curtab = len(titles) - 1
 
 
-def edit_title(stdscr):
-    # Enable cursor
-    curses.curs_set(1)
-
-    # Add a window on top of the current title
-    editwin = curses.newwin(1,wsize - 1, 1, curtab*(wsize+1) + 1)
-
-    stdscr.refresh()
-    box = Textbox(editwin)
-    # Edit it up to wsize -1
-    box.edit()
-
-    # Disable cursor again
-    curses.curs_set(0)
-
-    # Get resulting contents
-    message = box.gather()
-    titles[curtab].name = message
-    stdscr.clear()
-
-def print_text_box(scroll):
+def print_body(scroll):
+    "Print body tabs"
     global curtab
     global pristine
     global titles
@@ -211,7 +196,7 @@ def print_text_box(scroll):
     word = titles[curtab].grep
     case_sensitive = titles[curtab].case_sensitive
 
-    if (case_sensitive):
+    if case_sensitive:
         word = word.upper()
 
     for line in text:
@@ -231,7 +216,13 @@ def print_text_box(scroll):
             line_ = line
 
         if word in line_:
-            win.addstr(line)
+            parts = re.split(f"({word}|[()])", line)
+            for part in parts:
+                if word == part:
+                    color = curses.color_pair(COLOR_WORD_FOUND)
+                    win.addstr(part, color)
+                else:
+                    win.addstr(part)
             continue
 
 
@@ -258,7 +249,8 @@ def help(stdscr):
     stdscr.addstr(mid_x + 3, mid_y + 2, "d   -   Delete Tab")
     stdscr.addstr(mid_x + 4, mid_y + 2, "p   -   Pause")
     stdscr.addstr(mid_x + 5, mid_y + 2, "/   -   Toggle case sensitive search")
-    stdscr.addstr(mid_x + 6, mid_y + 2, "e   -   Edit the tab name")
+    stdscr.addstr(mid_x + 6, mid_y + 2, "s   -   Save profile")
+    stdscr.addstr(mid_x + 7, mid_y + 2, "l   -   Load profile")
     stdscr.addstr(mid_x + 9, mid_y + 2, "Home, Page UP, Page Down works also")
     stdscr.refresh()
     stdscr.timeout(-1)
@@ -318,7 +310,7 @@ def draw_screen(stdscr, scroll):
 
 
     print_all_tabs(stdscr)
-    print_text_box(draw_screen.scroll)
+    print_body(draw_screen.scroll)
     stdscr.refresh()
 
 def scroll_text(stdscr, lines):
@@ -392,7 +384,7 @@ def draw_screen(stdscr, scroll):
 
 
     print_all_tabs(stdscr)
-    print_text_box(draw_screen.scroll)
+    print_body(draw_screen.scroll)
     stdscr.refresh()
 
 def scroll_text(stdscr, lines):
@@ -463,80 +455,7 @@ def draw_screen(stdscr, scroll):
 
 
     print_all_tabs(stdscr)
-    print_text_box(draw_screen.scroll)
-    stdscr.refresh()
-
-def scroll_text(stdscr, lines):
-    if draw_screen.scroll <= 0:
-        pristine.unpause()
-    draw_screen(stdscr, lines)
-
-
-def main(stdscr):
-    global quitting
-    global redraw
-    global clear_screen
-    stdscr.keypad(True)
-    # Block TIMEOUT ms (100 ms)
-    stdscr.timeout(TIMEOUT)
-    stdscr.getch()
-
-
-# Set find word
-def set_find(stdscr):
-    global clear_screen
-    global redraw
-    clear_screen = True
-    redraw = True
-
-    # Enable cursor
-    curses.curs_set(1)
-
-    # Add a window on top of the current title
-    mid_x = int(curses.LINES/2)
-    mid_y = int(curses.COLS/2) - 20
-    editwin = curses.newwin(1, 20, mid_x, mid_y)
-    rectangle(stdscr, mid_x - 1, mid_y -1, mid_x+1, mid_y + 30)
-    stdscr.addstr(mid_x -1, mid_y + 2, "Grep for")
-
-    stdscr.refresh()
-    box = Textbox(editwin)
-    # Edit it up to wsize -1
-    box.edit()
-
-    # Disable cursor again
-    curses.curs_set(0)
-
-    # Get resulting contents
-    word = box.gather()
-    titles[curtab].grep = word.strip()
-    titles[curtab].name = word.strip()
-
-
-def draw_screen(stdscr, scroll):
-    global clear_screen
-
-    if not hasattr(draw_screen, "scroll"):
-        draw_screen.scroll = 0
-
-    draw_screen.scroll += scroll
-
-    if clear_screen:
-        stdscr.clear()
-        clear_screen = False
-
-    # static variable
-
-    # No scroll set anymore. Let the test run
-    if draw_screen.scroll <= 0:
-        draw_screen.scroll = 0
-        # pristine.unpause()
-    else:
-        pristine.pause()
-
-
-    print_all_tabs(stdscr)
-    print_text_box(draw_screen.scroll)
+    print_body(draw_screen.scroll)
     stdscr.refresh()
 
 def scroll_text(stdscr, lines):
@@ -609,7 +528,80 @@ def draw_screen(stdscr, scroll):
 
 
     print_all_tabs(stdscr)
-    print_text_box(draw_screen.scroll)
+    print_body(draw_screen.scroll)
+    stdscr.refresh()
+
+def scroll_text(stdscr, lines):
+    if draw_screen.scroll <= 0:
+        pristine.unpause()
+    draw_screen(stdscr, lines)
+
+
+def main(stdscr):
+    global quitting
+    global redraw
+    global clear_screen
+    stdscr.keypad(True)
+    # Block TIMEOUT ms (100 ms)
+    stdscr.timeout(TIMEOUT)
+    stdscr.getch()
+
+
+# Set find word
+def set_find(stdscr):
+    global clear_screen
+    global redraw
+    clear_screen = True
+    redraw = True
+
+    # Enable cursor
+    curses.curs_set(1)
+
+    # Add a window on top of the current title
+    mid_x = int(curses.LINES/2)
+    mid_y = int(curses.COLS/2) - 20
+    editwin = curses.newwin(1, 20, mid_x, mid_y)
+    rectangle(stdscr, mid_x - 1, mid_y -1, mid_x+1, mid_y + 30)
+    stdscr.addstr(mid_x -1, mid_y + 2, "Grep for")
+
+    stdscr.refresh()
+    box = Textbox(editwin)
+    # Edit it up to wsize -1
+    box.edit()
+
+    # Disable cursor again
+    curses.curs_set(0)
+
+    # Get resulting contents
+    word = box.gather()
+    titles[curtab].grep = word.strip()
+    titles[curtab].name = word.strip()
+
+
+def draw_screen(stdscr, scroll):
+    global clear_screen
+
+    if not hasattr(draw_screen, "scroll"):
+        draw_screen.scroll = 0
+
+    draw_screen.scroll += scroll
+
+    if clear_screen:
+        stdscr.clear()
+        clear_screen = False
+
+    # static variable
+
+    # No scroll set anymore. Let the test run
+    if draw_screen.scroll <= 0:
+        draw_screen.scroll = 0
+        # pristine.unpause()
+    else:
+        pristine.pause()
+
+
+    print_all_tabs(stdscr)
+    print_body(draw_screen.scroll)
     stdscr.refresh()
 
 def scroll_text(stdscr, lines):
@@ -630,31 +622,7 @@ def main(stdscr):
 
 # Set find word
 def set_grep_word(stdscr):
-    global clear_screen
-    global redraw
-    clear_screen = True
-    redraw = True
-
-    # Enable cursor
-    curses.curs_set(1)
-
-    # Add a window on top of the current title
-    mid_x = int(curses.LINES/2)
-    mid_y = int(curses.COLS/2) - 20
-    editwin = curses.newwin(1, 20, mid_x, mid_y)
-    rectangle(stdscr, mid_x - 1, mid_y -1, mid_x+1, mid_y + 30)
-    stdscr.addstr(mid_x -1, mid_y + 2, "Grep for")
-
-    stdscr.refresh()
-    box = Textbox(editwin)
-    # Edit it up to wsize -1
-    box.edit()
-
-    # Disable cursor again
-    curses.curs_set(0)
-
-    # Get resulting contents
-    word = box.gather()
+    word = get_input(stdscr, "Grep for: ")
     titles[curtab].grep = word.strip()
     titles[curtab].name = word.strip()
 
@@ -671,8 +639,6 @@ def draw_screen(stdscr, scroll):
         stdscr.clear()
         clear_screen = False
 
-    # static variable
-
     # No scroll set anymore. Let the test run
     if draw_screen.scroll <= 0:
         draw_screen.scroll = 0
@@ -682,7 +648,7 @@ def draw_screen(stdscr, scroll):
 
 
     print_all_tabs(stdscr)
-    print_text_box(draw_screen.scroll)
+    print_body(draw_screen.scroll)
     stdscr.refresh()
 
 def scroll_text(stdscr, lines):
@@ -690,6 +656,64 @@ def scroll_text(stdscr, lines):
         pristine.unpause()
     draw_screen(stdscr, lines)
 
+
+def save_profile_to_file(word):
+    global titles
+    with open(f"{word.strip()}.json", 'w') as f:
+        json.dump(titles, f, sort_keys=True, cls=TabEncoder)
+
+def get_input(stdscr, text):
+    global clear_screen
+    global redraw
+    clear_screen = True
+    redraw = True
+
+    # Enable cursor
+    curses.curs_set(1)
+
+    # Add a window on top of the current title
+    mid_x = int(curses.LINES/2)
+    mid_y = int(curses.COLS/2) - 20
+    editwin = curses.newwin(1, 20, mid_x, mid_y)
+    rectangle(stdscr, mid_x - 1, mid_y -1, mid_x+1, mid_y + 30)
+    stdscr.addstr(mid_x -1, mid_y + 2, text)
+
+    stdscr.refresh()
+    box = Textbox(editwin)
+    # Edit it up to wsize -1
+    box.edit()
+
+    # Disable cursor again
+    curses.curs_set(0)
+    return box.gather()
+
+def save_profile(stdscr):
+    """ Save profile to file"""
+
+    word = get_input(stdscr, "Saving: Profile name:")
+    # Get resulting contents
+    save_profile_to_file(word)
+
+
+def load_profile_from_file(word):
+    global titles
+    with open(f"{word.strip()}.json", 'r') as f:
+        input = json.loads(f.read())
+        titles = []
+        for t in input:
+            tab = Tab(t['name'])
+            tab.case_sensitive = t['case_sensitive']
+            tab.grep = t['grep']
+            titles.append(tab)
+
+
+
+def load_profile(stdscr):
+    """ Save profile to file"""
+
+    word = get_input(stdscr, "Loading: Profile name:")
+    # Get resulting contents
+    load_profile_from_file(word)
 
 def main(stdscr):
     global quitting
@@ -701,8 +725,6 @@ def main(stdscr):
 
     key = ''
 
-    # Add initial tab
-    add_new_tab()
     while key != ord('q'):
         if redraw:
             draw_screen(stdscr, 0)
@@ -720,8 +742,6 @@ def main(stdscr):
             move_left()
         if key == curses.KEY_RIGHT:
             move_right()
-        if key == ord('e'):
-            edit_title(stdscr)
         if key == ord('/'):
             set_grep_word(stdscr)
         if key == curses.KEY_UP:
@@ -737,6 +757,12 @@ def main(stdscr):
         if key == ord('c'):
             # Chance the case sensitive
             titles[curtab].case_sensitive = not titles[curtab].case_sensitive
+        if key == ord('s'):
+            # Chance the case sensitive
+            save_profile(stdscr)
+        if key == ord('l'):
+            # Chance the case sensitive
+            load_profile(stdscr)
 
         if key == curses.KEY_HOME:
             # size of the window
@@ -755,8 +781,6 @@ def main(stdscr):
                 # Hack to go to the bottom of the text on unpause
                 draw_screen.scroll = 0
                 scroll_text(stdscr, -200)
-        # else:
-        #     print(f"Key = {key}")
 
     quitting = True
 
@@ -764,9 +788,7 @@ def main(stdscr):
 def ingest_from_file(filename):
     global quitting
 
-    sec = 0
     file = pathlib.Path(filename)
-    stat = file.stat()
 
     with open(filename) as f:
         for line in f:
@@ -778,13 +800,8 @@ def ingest_from_file(filename):
 def usage():
     print("Multi tab grepper")
     print("Usage:")
-    print(f"  {sys.argv[0]} <file to dump>")
+    print(f"  {sys.argv[0]} <file to dump> [-f <profile>]")
 
-COLOR_INSENSITIVE_NOT_SELECTED = 1
-COLOR_INSENSITIVE_SELECTED = 2
-COLOR_SENSITIVE_SELECTED = 3
-COLOR_SENSITIVE_NOT_SELECTED = 4
-COLOR_STOPPED = 5
 
 
 if __name__ == "__main__":
@@ -792,6 +809,10 @@ if __name__ == "__main__":
         usage()
         sys.exit(1)
 
+    profile = sys.argv[2:] or []
+    if len(profile) == 2 and profile[0] == '-f':
+        print("Loading profile from file")
+        load_profile_from_file(profile[1])
 
     curses.initscr()
 
@@ -809,6 +830,8 @@ if __name__ == "__main__":
     curses.init_pair(COLOR_SENSITIVE_NOT_SELECTED, curses.COLOR_GREEN, curses.COLOR_BLACK)
     # Case senstive and selected
     curses.init_pair(COLOR_SENSITIVE_SELECTED, curses.COLOR_GREEN, curses.COLOR_WHITE)
+    # In the body
+    curses.init_pair(COLOR_WORD_FOUND, curses.COLOR_RED, curses.COLOR_BLACK)
 
 
     x = threading.Thread(target=ingest_from_file, args=(sys.argv[1],))
