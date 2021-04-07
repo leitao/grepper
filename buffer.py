@@ -1,5 +1,6 @@
 import globvar
 
+
 class Buffer:
     # Main buffer
     main_buffer = []
