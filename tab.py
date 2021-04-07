@@ -18,25 +18,34 @@ def get_idx():
 
 def set_grep_word(stdscr):
     word = get_input(stdscr, "Grep for: ")
-    titles[curtab].grep = word.strip()
-    titles[curtab].name = word.strip()
+    titles[get_idx()].grep = word.strip()
+    titles[get_idx()].name = word.strip()
+
+
+def decrease_idx():
+    global curtab
+    if curtab > 1:
+        curtab -= 1
+
+
+def increase_idx():
+    global curtab
+    curtab += 1
 
 
 def delete_tab():
     globvar.clear_screen = True
     globvar.redraw = True
 
-    if len(titles) > 0:
+    if len(titles) > 1:
         titles.pop(get_idx())
-        global curtab
-        curtab -= 1
+        decrease_idx()
 
 
 def add_new_tab():
-    global curtab
     globvar.redraw = True
-    curtab += 1
-    titles.append(Tab(f"Unfiltered"))
+    increase_idx()
+    titles.append(Tab(globvar.unamed))
 
 
 def print_all_tabs(stdscr):
@@ -52,6 +61,10 @@ def print_tab(stdscr, tab, active):
     ulx = globvar.cur_pos
     lry = hsize
     lrx = globvar.cur_pos + wsize
+    if lrx >= curses.COLS:
+        # No enough space in the x row
+        return
+
     rectangle(stdscr, uly, ulx, lry, lrx)
 
     if tab.case_sensitive and active:
@@ -77,36 +90,37 @@ def print_tab(stdscr, tab, active):
         stdscr.addstr(uly + 1, curses.COLS - 10, f"PAUSED", curses.color_pair(COLOR_STOPPED))
 
 
+def is_last_tab():
+    if curtab == len(titles):
+        return True
+    return False
+
+
 def move_left():
-    global curtab
     globvar.clear_screen = True
     globvar.redraw = True
 
     # is the current tab the last one
-    if curtab == len(titles) and titles[curtab] == "Unfiltered":
+    if is_last_tab() and titles[get_idx()].name == "Unfiltered":
         delete_tab()
         return
 
     # Just go left
-    curtab -= 1
-    if curtab < 0:
-        curtab = 0
+    decrease_idx()
 
 
 def move_right():
-    global curtab
-
     globvar.clear_screen = True
     globvar.redraw = True
 
     # is the current tab the last one
-    if curtab == len(titles) - 1:
+    if get_idx() == len(titles) - 1:
         # add a new one
         add_new_tab()
         return
 
     # Just move
-    curtab += 1
+    increase_idx()
 
 
 class Tab:

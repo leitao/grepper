@@ -82,7 +82,7 @@ def main(stdscr):
             scroll_text(stdscr, -10)
         if key == ord('c'):
             # Chance the case sensitive
-            tab.titles[tab.curtab].case_sensitive = not tab.titles[tab.curtab].case_sensitive
+            tab.titles[tab.get_idx()].case_sensitive = not tab.titles[tab.get_idx()].case_sensitive
         if key == ord('s'):
             # Chance the case sensitive
             save_profile(stdscr)

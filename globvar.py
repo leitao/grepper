@@ -9,3 +9,4 @@ redraw = True
 # Wait for getchr() otherwise refresh
 TIMEOUT = 100
 path = os.path.expanduser("~") + "/.config/grepper"
+unamed = "Unfiltered"
