@@ -17,8 +17,8 @@ def print_body(scroll):
     else:
         text = globvar.pristine.get_main()[:-scroll]
 
-    if tab.get_idx() < 0:
-        raise Exception("Something goes wrong with tabs")
+    if tab.get_idx() < 0 or tab.get_idx() > tab.get_amount_tabs() - 1:
+        raise Exception(f"Something goes wrong with tabs {tab.get_idx()} - {tab.get_idx()} | {tab.get_amount_tabs()}")
 
     word = tab.titles[tab.get_idx()].grep
     case_sensitive = tab.titles[tab.get_idx()].case_sensitive

@@ -1,4 +1,3 @@
-import curses
 from curses.textpad import rectangle
 from colors import *
 from input import get_input
@@ -8,12 +7,13 @@ import globvar
 wsize = 15
 hsize = 2
 titles = []
-curtab = 0
+# index is the current index in the array. Tab 0 will be index 0
+index = -1
 cur_pos = 2
 
 
 def get_idx():
-    return curtab - 1
+    return index
 
 
 def set_grep_word(stdscr):
@@ -23,14 +23,14 @@ def set_grep_word(stdscr):
 
 
 def decrease_idx():
-    global curtab
-    if curtab > 1:
-        curtab -= 1
+    global index
+    if index > 0:
+        index -= 1
 
 
 def increase_idx():
-    global curtab
-    curtab += 1
+    global index
+    index += 1
 
 
 def delete_tab():
@@ -91,7 +91,7 @@ def print_tab(stdscr, tab, active):
 
 
 def is_last_tab():
-    if curtab == len(titles):
+    if get_idx() == len(titles) - 1:
         return True
     return False
 
@@ -114,7 +114,7 @@ def move_right():
     globvar.redraw = True
 
     # is the current tab the last one
-    if get_idx() == len(titles) - 1:
+    if is_last_tab():
         # add a new one
         add_new_tab()
         return
@@ -128,3 +128,7 @@ class Tab:
         self.name = title
         self.grep = ""
         self.case_sensitive = True
+
+
+def get_amount_tabs():
+    return len(titles)
