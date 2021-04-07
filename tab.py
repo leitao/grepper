@@ -5,39 +5,47 @@ from input import get_input
 
 import globvar
 
+wsize = 15
+hsize = 2
+titles = []
+curtab = -1
+cur_pos = 2
+
 def set_grep_word(stdscr):
     word = get_input(stdscr, "Grep for: ")
-    globvar.titles[globvar.curtab].grep = word.strip()
-    globvar.titles[globvar.curtab].name = word.strip()
+    titles[curtab].grep = word.strip()
+    titles[curtab].name = word.strip()
 
 def delete_tab():
+    global curtab
     globvar.clear_screen = True
     globvar.redraw = True
 
-    if globvar.curtab > 0:
-        globvar.titles.pop(globvar.curtab)
-        globvar.curtab -= 1
+    if curtab > 0:
+        titles.pop(curtab)
+        curtab -= 1
 
 
 def add_new_tab():
+    global curtab
     globvar.redraw = True
-    globvar.curtab += 1
-    globvar.titles.append(Tab(f"Unfiltered"))
+    curtab += 1
+    titles.append(Tab(f"Unfiltered"))
 
 
 def print_all_tabs(stdscr):
     globvar.cur_pos = 0
 
-    for idx, tab in enumerate(globvar.titles):
-        print_tab(stdscr, tab, idx == globvar.curtab)
+    for idx, tab in enumerate(titles):
+        print_tab(stdscr, tab, idx == curtab)
     stdscr.refresh()
 
 
 def print_tab(stdscr, tab, active):
     uly = 0
     ulx = globvar.cur_pos
-    lry = globvar.hsize
-    lrx = globvar.cur_pos + globvar.wsize
+    lry = hsize
+    lrx = globvar.cur_pos + wsize
     rectangle(stdscr, uly, ulx, lry, lrx)
 
     if tab.case_sensitive and active:
@@ -57,27 +65,30 @@ def print_tab(stdscr, tab, active):
         title = tab.name
 
     stdscr.addstr(uly + 1, globvar.cur_pos + 1, f"{title} ", color)
-    globvar.cur_pos += globvar.wsize + 1
+    globvar.cur_pos += wsize + 1
 
     if globvar.pristine.paused:
         stdscr.addstr(uly + 1, curses.COLS - 10, f"PAUSED", curses.color_pair(COLOR_STOPPED))
 
 
 def move_left():
+    global curtab
     globvar.clear_screen = True
     globvar.redraw = True
 
-    globvar.curtab -= 1
-    if globvar.curtab < 0:
-        globvar.curtab = 0
+    curtab -= 1
+    if curtab < 0:
+        curtab = 0
 
 
 def move_right():
+    global curtab
+
     globvar.clear_screen = True
     globvar.redraw = True
-    globvar.curtab += 1
-    if (globvar.curtab >= len(globvar.titles)):
-        globvar.curtab = len(globvar.titles) - 1
+    curtab += 1
+    if curtab >= len(titles):
+        globvar.curtab = len(titles) - 1
 
 
 class Tab:

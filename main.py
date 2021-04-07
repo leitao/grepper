@@ -7,8 +7,8 @@ import colors
 from body import print_body
 from defaults import set_screen_defaults
 from file_ingestion import ingest_from_file
-from help import usage
-from tab import *
+from help import usage, show_help
+import tab
 from profiles import *
 from colors import *
 import globvar
@@ -17,7 +17,7 @@ import globvar
 def scroll_text(stdscr, lines):
     if draw_screen.scroll <= 0:
         globvar.pristine.unpause()
-    globvar.draw_screen(stdscr, lines)
+    draw_screen(stdscr, lines)
 
 
 def draw_screen(stdscr, scroll):
@@ -36,7 +36,7 @@ def draw_screen(stdscr, scroll):
     else:
         globvar.pristine.pause()
 
-    print_all_tabs(stdscr)
+    tab.print_all_tabs(stdscr)
     print_body(draw_screen.scroll)
     stdscr.refresh()
 
@@ -45,12 +45,12 @@ def main(stdscr):
     set_screen_defaults(stdscr)
 
     # Add initial tab
-    add_new_tab()
+    tab.add_new_tab()
     globvar.redraw = True
 
     key = ''
 
-    while key != ord('q'):
+    while key != ord('q') and globvar.quitting is False:
         if globvar.redraw:
             draw_screen(stdscr, 0)
             globvar.redraw = False
@@ -60,15 +60,15 @@ def main(stdscr):
             continue
 
         if key == ord('a'):
-            add_new_tab()
+            tab.add_new_tab()
         if key == ord('d'):
-            delete_tab()
+            tab.delete_tab()
         if key == curses.KEY_LEFT:
-            move_left()
+            tab.move_left()
         if key == curses.KEY_RIGHT:
-            move_right()
+            tab.move_right()
         if key == ord('/'):
-            set_grep_word(stdscr)
+            tab.set_grep_word(stdscr)
             globvar.clear_screen = True
         if key == curses.KEY_UP:
             scroll_text(stdscr, 1)
@@ -77,12 +77,12 @@ def main(stdscr):
         if key == curses.KEY_PPAGE:
             scroll_text(stdscr, 10)
         if key == ord('?') or key == ord('h'):
-            help(stdscr)
+            show_help(stdscr)
         if key == curses.KEY_NPAGE:
             scroll_text(stdscr, -10)
         if key == ord('c'):
             # Chance the case sensitive
-            globvar.titles[globvar.curtab].case_sensitive = not globvar.titles[globvar.curtab].case_sensitive
+            tab.titles[tab.curtab].case_sensitive = not tab.titles[tab.curtab].case_sensitive
         if key == ord('s'):
             # Chance the case sensitive
             save_profile(stdscr)

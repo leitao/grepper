@@ -1,5 +1,6 @@
 import curses
 import re
+import tab
 
 import colors
 import globvar
@@ -16,14 +17,14 @@ def print_body(scroll):
     else:
         text = globvar.pristine.get_main()[:-scroll]
 
-    word = globvar.titles[globvar.curtab].grep
-    case_sensitive = globvar.titles[globvar.curtab].case_sensitive
+    word = tab.titles[tab.curtab].grep
+    case_sensitive = tab.titles[tab.curtab].case_sensitive
 
     if case_sensitive:
         word = word.upper()
 
     for line in text:
-        if globvar.curtab < 0:
+        if tab.curtab < 0:
             # Dump the whole text
             win.addstr(line)
             continue

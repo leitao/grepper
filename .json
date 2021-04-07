@@ -1,1 +1,1 @@
-[{"name": "Panel 0"}]
+[{"case_sensitive": true, "grep": "all", "name": "all 0"}, {"case_sensitive": true, "grep": "bla", "name": "bla"}, {"case_sensitive": false, "grep": "bsd", "name": "bsd"}]
