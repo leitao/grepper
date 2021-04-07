@@ -24,4 +24,4 @@ def get_input(stdscr, text):
 
     # Disable cursor again
     curses.curs_set(0)
-    return box.gather()
+    return box.gather().strip()

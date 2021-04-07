@@ -18,8 +18,8 @@ def get_idx():
 
 def set_grep_word(stdscr):
     word = get_input(stdscr, "Grep for: ")
-    titles[get_idx()].grep = word.strip()
-    titles[get_idx()].name = word.strip()
+    titles[get_idx()].grep = word
+    titles[get_idx()].name = word
 
 
 def decrease_idx():
@@ -123,12 +123,18 @@ def move_right():
     increase_idx()
 
 
+
+def get_amount_tabs():
+    return len(titles)
+
+
+def highlight(stdscr):
+    word = get_input(stdscr, "Highlight word: ")
+    titles[get_idx()].highlight = word
+    
 class Tab:
     def __init__(self, title):
         self.name = title
         self.grep = ""
         self.case_sensitive = True
-
-
-def get_amount_tabs():
-    return len(titles)
+        self.highlight = ""

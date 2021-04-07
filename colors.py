@@ -7,6 +7,7 @@ COLOR_SENSITIVE_SELECTED = 3
 COLOR_SENSITIVE_NOT_SELECTED = 4
 COLOR_STOPPED = 5
 COLOR_WORD_FOUND = 6
+COLOR_ADDITIONAL_WORD_FOUND = 7
 
 
 def set_colors():
@@ -22,3 +23,5 @@ def set_colors():
     curses.init_pair(COLOR_SENSITIVE_SELECTED, curses.COLOR_GREEN, curses.COLOR_WHITE)
     # In the body
     curses.init_pair(COLOR_WORD_FOUND, curses.COLOR_RED, curses.COLOR_BLACK)
+    # Additional word highlight
+    curses.init_pair(COLOR_ADDITIONAL_WORD_FOUND, curses.COLOR_GREEN, curses.COLOR_BLACK)

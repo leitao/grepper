@@ -63,33 +63,35 @@ def main(stdscr):
             tab.add_new_tab()
         if key == ord('d'):
             tab.delete_tab()
+        if key == ord('/'):
+            tab.set_grep_word(stdscr)
+            globvar.clear_screen = True
+        if key == ord('?') or key == ord('h'):
+            show_help(stdscr)
+        if key == ord('c'):
+            # Chance the case sensitive
+            tab.titles[tab.get_idx()].case_sensitive = not tab.titles[tab.get_idx()].case_sensitive
+        if key == ord('s'):
+            # Save profile
+            save_profile(stdscr)
+        if key == ord('l'):
+            # Chance the case sensitive
+            load_profile(stdscr)
+        if key == ord('*'):
+            # Chance the case sensitive
+            tab.highlight(stdscr)
         if key == curses.KEY_LEFT:
             tab.move_left()
         if key == curses.KEY_RIGHT:
             tab.move_right()
-        if key == ord('/'):
-            tab.set_grep_word(stdscr)
-            globvar.clear_screen = True
         if key == curses.KEY_UP:
             scroll_text(stdscr, 1)
         if key == curses.KEY_DOWN:
             scroll_text(stdscr, -1)
         if key == curses.KEY_PPAGE:
             scroll_text(stdscr, 10)
-        if key == ord('?') or key == ord('h'):
-            show_help(stdscr)
         if key == curses.KEY_NPAGE:
             scroll_text(stdscr, -10)
-        if key == ord('c'):
-            # Chance the case sensitive
-            tab.titles[tab.get_idx()].case_sensitive = not tab.titles[tab.get_idx()].case_sensitive
-        if key == ord('s'):
-            # Chance the case sensitive
-            save_profile(stdscr)
-        if key == ord('l'):
-            # Chance the case sensitive
-            load_profile(stdscr)
-
         if key == curses.KEY_HOME:
             # size of the window
             scroll_text(stdscr, len(globvar.pristine.get_main()) - (curses.LINES - hsize - 2))
