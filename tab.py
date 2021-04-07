@@ -8,21 +8,27 @@ import globvar
 wsize = 15
 hsize = 2
 titles = []
-curtab = -1
+curtab = 0
 cur_pos = 2
+
+
+def get_idx():
+    return curtab - 1
+
 
 def set_grep_word(stdscr):
     word = get_input(stdscr, "Grep for: ")
     titles[curtab].grep = word.strip()
     titles[curtab].name = word.strip()
 
+
 def delete_tab():
-    global curtab
     globvar.clear_screen = True
     globvar.redraw = True
 
-    if curtab > 0:
-        titles.pop(curtab)
+    if len(titles) > 0:
+        titles.pop(get_idx())
+        global curtab
         curtab -= 1
 
 
@@ -37,7 +43,7 @@ def print_all_tabs(stdscr):
     globvar.cur_pos = 0
 
     for idx, tab in enumerate(titles):
-        print_tab(stdscr, tab, idx == curtab)
+        print_tab(stdscr, tab, idx == get_idx())
     stdscr.refresh()
 
 
@@ -76,6 +82,12 @@ def move_left():
     globvar.clear_screen = True
     globvar.redraw = True
 
+    # is the current tab the last one
+    if curtab == len(titles) and titles[curtab] == "Unfiltered":
+        delete_tab()
+        return
+
+    # Just go left
     curtab -= 1
     if curtab < 0:
         curtab = 0
@@ -86,9 +98,15 @@ def move_right():
 
     globvar.clear_screen = True
     globvar.redraw = True
+
+    # is the current tab the last one
+    if curtab == len(titles) - 1:
+        # add a new one
+        add_new_tab()
+        return
+
+    # Just move
     curtab += 1
-    if curtab >= len(titles):
-        globvar.curtab = len(titles) - 1
 
 
 class Tab:

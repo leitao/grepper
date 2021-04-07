@@ -118,7 +118,6 @@ if __name__ == "__main__":
 
     profile = sys.argv[2:] or []
     if len(profile) == 2 and profile[0] == '-f':
-        print("Loading profile from file")
         load_profile_from_file(profile[1])
 
     curses.initscr()
@@ -129,16 +128,17 @@ if __name__ == "__main__":
     curses.start_color()
     colors.set_colors()
 
-    x = threading.Thread(target=ingest_from_file, args=(sys.argv[1],))
+    threads = threading.Thread(target=ingest_from_file, args=(sys.argv[1],))
     # x = threading.Thread(target=ingest_from_stdin)
-    x.start()
+    threads.start()
 
     try:
         wrapper(main)
     except KeyboardInterrupt:
         # Let the other thread exist also
-        quitting = True
+        globvar.quitting = True
 
-    x.join()
+    # Wait for the ingestor thread
+    threads.join()
 
-curses.endwin()
+    curses.endwin()
