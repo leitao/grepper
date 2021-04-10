@@ -138,7 +138,7 @@ def goto(stdscr):
     word = get_input(stdscr, "Go to: ")
     if not word:
         return
-    titles[get_idx()].goto = word
+    titles[get_idx()].goto = wordd
 
 
 class Tab:
