@@ -62,10 +62,6 @@ class PrintBuffer:
                 return True
         return False
 
-    def full(self):
-        body_size = curses.LINES - 5
-        return False
-
     def add(self, line):
         self.text.insert(0, line)
 
@@ -116,6 +112,7 @@ class PrintBuffer:
             return
 
         self.highlight_all(win, line, self.words)
+
 
     def print_array(self, win, array_to_be_printed):
         for word, color in array_to_be_printed:

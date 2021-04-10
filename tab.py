@@ -1,4 +1,6 @@
 from curses.textpad import rectangle
+
+import goto
 from colors import *
 from input import get_input
 
@@ -133,12 +135,13 @@ def get_curent_buffer():
     return titles[get_idx()]
 
 
-def goto(stdscr):
+def goto_backward(stdscr):
     globvar.redraw = True
     word = get_input(stdscr, "Go to: ")
     if not word:
         return
-    titles[get_idx()].goto = wordd
+    titles[get_idx()].goto = (word, goto.BACK)
+
 
 
 class Tab:
@@ -147,5 +150,3 @@ class Tab:
         self.grep = ""
         # List of additional words to high light
         self.highlight = []
-
-

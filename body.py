@@ -12,7 +12,6 @@ def print_body():
     win = curses.newwin(curses.LINES - 3, curses.COLS, 3, 0)
     win.scrollok(True)
 
-    # scroll = globvar.pristine.scroll
     text = globvar.pristine.get_main()
 
     if tab.get_idx() < 0 or tab.get_idx() > tab.get_amount_tabs() - 1:
@@ -32,8 +31,5 @@ def print_body():
     for line in reversed(text):
         if word in line:
             pb.add(line)
-
-        if pb.full():
-            break
 
     pb.print_all(win)

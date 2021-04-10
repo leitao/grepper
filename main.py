@@ -70,7 +70,7 @@ def main(stdscr):
             tab.delete_tab()
         if key == ord('f'):
             tab.set_grep_word(stdscr)
-        if key == ord('?') or key == ord('h'):
+        if key == ord('h'):
             show_help(stdscr)
         if key == ord('s'):
             # Save profile
@@ -81,9 +81,9 @@ def main(stdscr):
         if key == ord('*'):
             # highlight another word
             tab.highlight(stdscr)
-        if key == ord('/'):
+        if key == ord('?'):
             # highlight another word
-            tab.goto(stdscr)
+            tab.goto_backward(stdscr)
         if key == ord('p'):
             if not globvar.pristine.paused:
                 globvar.pristine.pause()
