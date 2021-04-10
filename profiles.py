@@ -41,7 +41,6 @@ def load_profile_from_file(profile):
             tab.titles = []
             for t in input_json:
                 atab = tab.Tab(t['name'])
-                atab.case_sensitive = t['case_sensitive']
                 atab.grep = t['grep']
                 tab.titles.append(atab)
     except FileNotFoundError:

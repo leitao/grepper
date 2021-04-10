@@ -12,7 +12,6 @@ def ingest_from_file(filename):
     try:
         with open(filename) as f:
             for line in f:
-                time.sleep(.05)
                 ingest_text(line)
                 if globvar.quitting:
                     return

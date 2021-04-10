@@ -20,6 +20,9 @@ def set_grep_word(stdscr):
     word = get_input(stdscr, "Grep for: ")
     titles[get_idx()].grep = word
     titles[get_idx()].name = word
+    # Clear screen is required since the word size (in the tab) could have changed
+    globvar.clear_screen = True
+    globvar.redraw = True
 
 
 def decrease_idx():
@@ -67,21 +70,12 @@ def print_tab(stdscr, tab, active):
 
     rectangle(stdscr, uly, ulx, lry, lrx)
 
-    if tab.case_sensitive and active:
+    if active:
         color = curses.color_pair(COLOR_SENSITIVE_SELECTED)
-    elif tab.case_sensitive and not active:
+    else:
         color = curses.color_pair(COLOR_SENSITIVE_NOT_SELECTED)
-    elif not tab.case_sensitive and active:
-        color = curses.color_pair(COLOR_INSENSITIVE_SELECTED)
-    elif not tab.case_sensitive and not active:
-        color = curses.color_pair(COLOR_INSENSITIVE_NOT_SELECTED)
-    else:
-        raise Exception("no color selected")
 
-    if not tab.case_sensitive:
-        title = tab.name.lower()
-    else:
-        title = tab.name
+    title = tab.name
 
     stdscr.addstr(uly + 1, globvar.cur_pos + 1, f"{title} ", color)
     globvar.cur_pos += wsize + 1
@@ -123,18 +117,35 @@ def move_right():
     increase_idx()
 
 
-
 def get_amount_tabs():
     return len(titles)
 
 
 def highlight(stdscr):
+    globvar.redraw = True
     word = get_input(stdscr, "Highlight word: ")
-    titles[get_idx()].highlight = word
-    
+    if not word:
+        return
+    titles[get_idx()].highlight.append(word)
+
+
+def get_curent_buffer():
+    return titles[get_idx()]
+
+
+def goto(stdscr):
+    globvar.redraw = True
+    word = get_input(stdscr, "Go to: ")
+    if not word:
+        return
+    titles[get_idx()].goto = word
+
+
 class Tab:
     def __init__(self, title):
         self.name = title
         self.grep = ""
-        self.case_sensitive = True
-        self.highlight = ""
+        # List of additional words to high light
+        self.highlight = []
+
+

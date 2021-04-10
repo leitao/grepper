@@ -4,58 +4,36 @@ import tab
 
 import colors
 import globvar
+from buffer import PrintBuffer
 
 
-def print_body(scroll):
+def print_body():
     """Print body text"""
     win = curses.newwin(curses.LINES - 3, curses.COLS, 3, 0)
     win.scrollok(True)
 
-    if scroll == 0:
-        # No scroll set. Get the whole text
-        text = globvar.pristine.get_main()
-    else:
-        text = globvar.pristine.get_main()[:-scroll]
+    # scroll = globvar.pristine.scroll
+    text = globvar.pristine.get_main()
 
     if tab.get_idx() < 0 or tab.get_idx() > tab.get_amount_tabs() - 1:
         raise Exception(f"Something goes wrong with tabs {tab.get_idx()} - {tab.get_idx()} | {tab.get_amount_tabs()}")
 
+    # Word to highlight light
     word = tab.titles[tab.get_idx()].grep
-    additional = tab.titles[tab.get_idx()].highlight
-    case_sensitive = tab.titles[tab.get_idx()].case_sensitive
+    # any additional word to highlight
+    array_and_colors = [(word, colors.COLOR_ADDITIONAL_WORD_FOUND) for word in tab.titles[tab.get_idx()].highlight]
+    # Main word should come first
+    if word:
+        array_and_colors.insert(0, (word, colors.COLOR_WORD_FOUND))
 
-    if case_sensitive:
-        word = word.upper()
+    pb = PrintBuffer(array_and_colors)
 
-    for line in text:
-        # Not grep word selected
-        if not word and not additional:
-            win.addstr(line)
-            continue
+    # Grep from bottoms up (Performance)
+    for line in reversed(text):
+        if word in line:
+            pb.add(line)
 
-        # need to highlight the word
-        highlight(win, line, case_sensitive, word, additional)
+        if pb.full():
+            break
 
-    win.refresh()
-
-
-def highlight(win, line, case_sensitive, word, additional_word):
-    if case_sensitive:
-        line_ = line.upper()
-    else:
-        line_ = line
-    if word in line_:
-        parts = re.split(f"({word}|[()])", line)
-        for part in parts:
-            if word == part:
-                color = curses.color_pair(colors.COLOR_WORD_FOUND)
-                win.addstr(part, color)
-            else:
-                # Do it again
-                partwos = re.split(f"({additional_word}|[()])", part)
-                for partwo in partwos:
-                    if partwo == additional_word:
-                        color = curses.color_pair(colors.COLOR_ADDITIONAL_WORD_FOUND)
-                        win.addstr(partwo, color)
-                    else:
-                        win.addstr(partwo)
+    pb.print_all(win)
