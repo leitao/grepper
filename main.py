@@ -4,12 +4,16 @@ import sys
 
 # Project files
 import colors
-from body import print_body
+import goto
+import header
+import popup
+import body
 from defaults import set_screen_defaults
 from file_ingestion import ingest_from_file
-from help import usage, show_help
+import help
 import tab
-from profiles import *
+import move
+import profile
 from colors import *
 import globvar
 
@@ -19,20 +23,14 @@ def draw_screen(stdscr):
         stdscr.clear()
         globvar.clear_screen = False
 
-    tab.print_all_tabs(stdscr)
-    print_body()
+    # Print Header
+    header.print_all_tabs(stdscr)
+    # Print body
+    body.print_body()
+
+    # And refresh screen
     stdscr.refresh()
 
-
-def scroll_to_top():
-    current = tab.get_current_tab()
-    current.scroll = tab.SCROLL_TO_HOME
-    globvar.redraw = True
-
-def scroll_to_bottom():
-    current = tab.get_current_tab()
-    current.scroll = 0
-    globvar.redraw = True
 
 def set_scroll(param):
     current = tab.get_current_tab()
@@ -69,27 +67,27 @@ def main(stdscr):
         if key == ord('d'):
             tab.delete_tab()
         if key == ord('f'):
-            tab.set_grep_word(stdscr)
+            popup.set_grep_word(stdscr)
         if key == ord('h'):
-            show_help(stdscr)
+            help.show_help(stdscr)
         if key == ord('s'):
             # Save profile
-            save_profile(stdscr)
+            profile.save_profile(stdscr)
         if key == ord('l'):
             # Load profile
-            load_profile(stdscr)
+            profile.load_profile(stdscr)
         if key == ord('*'):
             # highlight another word
-            tab.highlight(stdscr)
+            popup.highlight(stdscr)
         if key == ord('?'):
             # highlight another word
-            tab.goto_backward(stdscr)
+            goto.goto_backward(stdscr)
         if key == ord('p'):
             tab.get_current_tab().toggle_pause()
         if key == curses.KEY_LEFT:
-            tab.move_left()
+            move.move_left()
         if key == curses.KEY_RIGHT:
-            tab.move_right()
+            move.move_right()
         if key == curses.KEY_UP:
             set_scroll(1)
         if key == curses.KEY_DOWN:
@@ -100,22 +98,22 @@ def main(stdscr):
             set_scroll(-10)
         if key == curses.KEY_HOME:
             # size of the window
-            scroll_to_top()
+            goto.scroll_to_top()
         KEY_ENTER = 10
         if key == KEY_ENTER or key == curses.KEY_END:
-            scroll_to_bottom()
+            goto.scroll_to_bottom()
 
     globvar.quitting = True
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        usage()
+        help.usage()
         sys.exit(1)
 
     profile = sys.argv[2:] or []
     if len(profile) == 2 and profile[0] == '-f':
-        load_profile_from_file(profile[1])
+        profile.load_profile_from_file(profile[1])
 
     curses.initscr()
     curses.start_color()

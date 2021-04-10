@@ -4,10 +4,7 @@ import tab
 
 import colors
 import globvar
-from buffer import PrintBuffer
-
-
-
+from print_buffer import PrintBuffer
 
 
 def print_body():
