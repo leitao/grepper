@@ -14,12 +14,6 @@ from colors import *
 import globvar
 
 
-# def scroll_text(stdscr):
-#     if draw_screen.scroll <= 0:
-#         globvar.pristine.unpause()
-#     draw_screen(stdscr)
-
-
 def draw_screen(stdscr):
     if globvar.clear_screen:
         stdscr.clear()
@@ -30,18 +24,24 @@ def draw_screen(stdscr):
     stdscr.refresh()
 
 
-def scroll_to_zero():
-    globvar.pristine.goto_home()
+def scroll_to_top():
+    current = tab.get_current_tab()
+    current.scroll = tab.SCROLL_TO_HOME
     globvar.redraw = True
 
+def scroll_to_bottom():
+    current = tab.get_current_tab()
+    current.scroll = 0
+    globvar.redraw = True
 
 def set_scroll(param):
-    globvar.pristine.scroll += param
+    current = tab.get_current_tab()
+    length_min = curses.LINES - 4
 
-    if globvar.pristine.scroll < 0:
-        globvar.pristine.scroll = 0
-    if globvar.pristine.scroll > globvar.pristine.len():
-        globvar.pristine.scroll = globvar.pristine.len()
+    current.scroll += param
+
+    if current.scroll < 0:
+        current.scroll = 0
 
     globvar.redraw = True
 
@@ -85,12 +85,7 @@ def main(stdscr):
             # highlight another word
             tab.goto_backward(stdscr)
         if key == ord('p'):
-            if not globvar.pristine.paused:
-                globvar.pristine.pause()
-            else:
-                globvar.pristine.unpause()
-                # Hack to go to the bottom of the text on unpause
-                globvar.pristine.scroll = 0
+            tab.get_current_tab().toggle_pause()
         if key == curses.KEY_LEFT:
             tab.move_left()
         if key == curses.KEY_RIGHT:
@@ -100,16 +95,15 @@ def main(stdscr):
         if key == curses.KEY_DOWN:
             set_scroll(-1)
         if key == curses.KEY_PPAGE:
-            set_scroll(-10)
-        if key == curses.KEY_NPAGE:
             set_scroll(10)
+        if key == curses.KEY_NPAGE:
+            set_scroll(-10)
         if key == curses.KEY_HOME:
             # size of the window
-            scroll_to_zero()
+            scroll_to_top()
         KEY_ENTER = 10
         if key == KEY_ENTER or key == curses.KEY_END:
-            draw_screen.scroll = 0
-            globvar.pristine.unpause()
+            scroll_to_bottom()
 
     globvar.quitting = True
 

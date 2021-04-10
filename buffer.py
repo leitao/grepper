@@ -4,47 +4,23 @@ import colors
 import globvar
 import curses
 
+import tab
+
 
 class Buffer:
     # Main buffer
     main_buffer = []
-    # Buffer when the ingestion is paused
-    tmp = []
-
-    paused = False
-    consumable = False
-    scroll = 0
 
     def len(self):
         return len(self.main_buffer)
 
-    def goto_home(self):
-        scroll = -1
-
-    def pause(self):
-        self.paused = True
-        globvar.redraw = True
-
-    def unpause(self):
-        self.paused = False
-
-        if self.tmp:
-            self.main_buffer = self.main_buffer + self.tmp
-            self.tmp = []
-        self.consumable = True
-        globvar.clear_screen = True
-        globvar.redraw = True
+    def reset(self, newbuffer):
+        self.main_buffer = newbuffer
 
     def ingest(self, line):
-        if not self.paused:
-            self.main_buffer.append(line)
-            self.consumable = True
-            globvar.redraw = True
-        else:
-            self.tmp.append(line)
+        self.main_buffer.append(line)
 
     def get_main(self):
-        self.consumable = False
         return self.main_buffer
 
 
@@ -65,8 +41,10 @@ class PrintBuffer:
     def add(self, line):
         self.text.insert(0, line)
 
-    def print_all(self, win):
-        for line in self.text:
+    def print_all(self, win, scroll):
+        text_to_be_printed = self.get_scrolled_text(self.text, scroll)
+
+        for line in text_to_be_printed:
             self.print_each_line(win, line)
 
         win.refresh()
@@ -101,7 +79,7 @@ class PrintBuffer:
                         ret.append((part, c))
             else:
                 # Don't care about a subsentence without words we care
-                ret.append((subsentences,c))
+                ret.append((subsentences, c))
 
         return ret
 
@@ -113,8 +91,36 @@ class PrintBuffer:
 
         self.highlight_all(win, line, self.words)
 
-
     def print_array(self, win, array_to_be_printed):
         for word, color in array_to_be_printed:
             win.addstr(word, curses.color_pair(color))
 
+    def get_scrolled_text(self, text, scroll):
+        if not scroll:
+            return text
+
+        length = len(text)
+        length_min = curses.LINES - 4
+
+        # length - lenth_min = first page of the text
+        if scroll == tab.SCROLL_TO_HOME:
+            scroll = length - length_min
+
+        to_be_displayed = length - scroll
+        if to_be_displayed <= length_min:
+            current = tab.get_current_tab()
+            current.scroll = length - length_min
+            return text[0:length_min]
+
+        # Crop the last `scroll` lines
+        return text[0:length - scroll]
+
+    def is_full(self, surplus):
+        """ Keep the PrintBuffer as big as the size"""
+        if surplus == tab.SCROLL_TO_HOME:
+            # Import everything
+            return False
+
+        length_min = curses.LINES - 4
+        if len(self.text) >= length_min + surplus:
+            return True

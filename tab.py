@@ -12,17 +12,17 @@ titles = []
 # index is the current index in the array. Tab 0 will be index 0
 index = -1
 cur_pos = 2
+SCROLL_TO_HOME = -1
 
 
 def get_idx():
     return index
 
 
-
 def set_grep_word(stdscr):
     word = get_input(stdscr, "Grep for: ")
-    get_curent_buffer().grep = word
-    get_curent_buffer().name = word
+    get_current_tab().grep = word
+    get_current_tab().name = word
     # Clear screen is required since the word size (in the tab) could have changed
     globvar.clear_screen = True
     globvar.redraw = True
@@ -83,7 +83,8 @@ def print_tab(stdscr, tab, active):
     stdscr.addstr(uly + 1, globvar.cur_pos + 1, f"{title} ", color)
     globvar.cur_pos += wsize + 1
 
-    if globvar.pristine.paused:
+    current = get_current_tab()
+    if current.paused:
         stdscr.addstr(uly + 1, curses.COLS - 10, f"PAUSED", curses.color_pair(COLOR_STOPPED))
 
 
@@ -98,7 +99,7 @@ def move_left():
     globvar.redraw = True
 
     # is the current tab the last one
-    if is_last_tab() and get_curent_buffer().name == "Unfiltered":
+    if is_last_tab() and get_current_tab().name == "Unfiltered":
         delete_tab()
         return
 
@@ -129,10 +130,10 @@ def highlight(stdscr):
     word = get_input(stdscr, "Highlight word: ")
     if not word:
         return
-    get_curent_buffer().highlight.append(word)
+    get_current_tab().highlight.append(word)
 
 
-def get_curent_buffer():
+def get_current_tab():
     return titles[get_idx()]
 
 
@@ -141,7 +142,13 @@ def goto_backward(stdscr):
     word = get_input(stdscr, "Go to: ")
     if not word:
         return
-    get_curent_buffer().goto = (word, goto.BACK)
+    get_current_tab().goto = (word, goto.BACK)
+
+
+def goto_home():
+    get_current_tab().scroll = SCROLL_TO_HOME
+
+
 
 
 class Tab:
@@ -150,3 +157,11 @@ class Tab:
         self.grep = ""
         # List of additional words to high light
         self.highlight = []
+        self.scroll = 0
+        self.paused = False
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        # Clear screen to get rid of the PAUSE text
+        globvar.clear_screen = True
+        globvar.redraw = True

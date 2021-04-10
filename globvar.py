@@ -22,3 +22,6 @@ path = os.path.expanduser("~") + "/.config/grepper"
 
 # Name of the recently created tabs
 unamed = "Unfiltered"
+
+# Dealy before checking if the input changed
+file_refresh_ms = 200
