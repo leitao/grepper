@@ -18,10 +18,11 @@ def get_idx():
     return index
 
 
+
 def set_grep_word(stdscr):
     word = get_input(stdscr, "Grep for: ")
-    titles[get_idx()].grep = word
-    titles[get_idx()].name = word
+    get_curent_buffer().grep = word
+    get_curent_buffer().name = word
     # Clear screen is required since the word size (in the tab) could have changed
     globvar.clear_screen = True
     globvar.redraw = True
@@ -97,7 +98,7 @@ def move_left():
     globvar.redraw = True
 
     # is the current tab the last one
-    if is_last_tab() and titles[get_idx()].name == "Unfiltered":
+    if is_last_tab() and get_curent_buffer().name == "Unfiltered":
         delete_tab()
         return
 
@@ -128,7 +129,7 @@ def highlight(stdscr):
     word = get_input(stdscr, "Highlight word: ")
     if not word:
         return
-    titles[get_idx()].highlight.append(word)
+    get_curent_buffer().highlight.append(word)
 
 
 def get_curent_buffer():
@@ -140,8 +141,7 @@ def goto_backward(stdscr):
     word = get_input(stdscr, "Go to: ")
     if not word:
         return
-    titles[get_idx()].goto = (word, goto.BACK)
-
+    get_curent_buffer().goto = (word, goto.BACK)
 
 
 class Tab:
